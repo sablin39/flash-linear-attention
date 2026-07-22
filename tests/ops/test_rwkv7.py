@@ -176,6 +176,100 @@ def test_chunk_wrapper_chunk_size(chunk_size: int):
     assert_close('ht', ref_ht, tri_ht, 0.002)
 
 
+@torch.no_grad()
+def test_chunk_returns_packed_varlen_intermediate_states():
+    torch.manual_seed(42)
+    lengths = [65, 129]
+    total_tokens = sum(lengths)
+    H, D, chunk_size = 1, 16, 64
+    dtype = torch.bfloat16
+
+    shape = (1, total_tokens, H, D)
+    r = torch.empty(shape, device=device).uniform_(-8, -6).to(dtype)
+    k = torch.empty(shape, device=device).uniform_(-8, -6).to(dtype)
+    v = torch.empty(shape, device=device).uniform_(-8, -6).to(dtype)
+    w = torch.empty(shape, device=device).uniform_(-8, -6).to(dtype)
+    kk = F.normalize(torch.empty(shape, device=device).uniform_(-1, 1), dim=-1).to(dtype)
+    a = -kk
+    b = kk * torch.empty(shape, device=device).uniform_(0, 0.1).to(dtype)
+    initial_state = torch.randn(len(lengths), H, D, D, device=device)
+    cu_seqlens = torch.tensor([0, lengths[0], total_tokens], device=device, dtype=torch.long)
+
+    ref_o, ref_final = chunk_rwkv7(
+        r=r,
+        w=w,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+    )
+    o, final_state, intermediate = chunk_rwkv7(
+        r=r,
+        w=w,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        return_intermediate_states=True,
+    )
+
+    assert intermediate.shape == (1, 5, H, D, D)
+    assert_close("o", ref_o, o, 0)
+    assert_close("final", ref_final, final_state, 0)
+
+    packed_offset = 0
+    intermediate_offset = 0
+    for sequence, length in enumerate(lengths):
+        for boundary in range(0, length, chunk_size):
+            if boundary == 0:
+                expected = initial_state[sequence: sequence + 1]
+            else:
+                _, expected = fused_recurrent_dplr_delta_rule(
+                    q=r[:, packed_offset: packed_offset + boundary],
+                    k=k[:, packed_offset: packed_offset + boundary],
+                    v=v[:, packed_offset: packed_offset + boundary],
+                    a=a[:, packed_offset: packed_offset + boundary],
+                    b=b[:, packed_offset: packed_offset + boundary],
+                    gk=w[:, packed_offset: packed_offset + boundary],
+                    initial_state=initial_state[sequence: sequence + 1],
+                    output_final_state=True,
+                )
+            assert_close(
+                f"sequence {sequence} boundary {boundary}",
+                expected,
+                intermediate[:, intermediate_offset].float(),
+                0.006,
+            )
+            intermediate_offset += 1
+        packed_offset += length
+
+    with torch.enable_grad(), pytest.raises(
+        AssertionError,
+        match="requires gradients to be disabled",
+    ):
+        chunk_rwkv7(
+            r=r,
+            w=w,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            return_intermediate_states=True,
+        )
+
+
 @pytest.mark.parametrize("B", [1])
 @pytest.mark.parametrize("T", [20, 1024, 4100, 131072])
 @pytest.mark.parametrize("H", [2])

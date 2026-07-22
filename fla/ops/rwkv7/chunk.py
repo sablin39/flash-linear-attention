@@ -27,6 +27,7 @@ def chunk_rwkv7(
     chunk_size: int | None = None,
     disable_recompute: bool = False,
     cp_context: FLACPContext | None = None,
+    return_intermediate_states: bool = False,
     **kwargs,
 ):
     """
@@ -68,6 +69,9 @@ def chunk_rwkv7(
             Context parallel context for distributed training across multiple devices.
             When provided, `initial_state` and `output_final_state` are not supported,
             and `cp_context.cu_seqlens` is used as the local `cu_seqlens`. Default: `None`.
+        return_intermediate_states (Optional[bool]):
+            Whether to return the recurrent state at the beginning of each physical chunk.
+            This is only supported when gradient calculation is disabled. Default: `False`.
     """
     if 'head_first' in kwargs:
         raise DeprecationWarning(
@@ -88,5 +92,6 @@ def chunk_rwkv7(
         safe_gate=safe_gate,
         chunk_size=chunk_size,
         disable_recompute=disable_recompute,
+        return_intermediate_states=return_intermediate_states,
         cp_context=cp_context,
     )

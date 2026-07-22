@@ -125,9 +125,10 @@ def chunk_dplr_fwd(
     )
 
     if disable_recompute:
-        return o, final_state, initial_state, (gi, ge, A_qk, A_qb, A_ak, qg, kg, ag, bg, w, h, v_new, A_ab_inv)
+        cache = (gi, ge, A_qk, A_qb, A_ak, qg, kg, ag, bg, w, h, v_new, A_ab_inv)
     else:
-        return o, final_state, initial_state, None
+        cache = None
+    return o, final_state, initial_state, cache, h
 
 
 class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
@@ -152,6 +153,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         chunk_size: int | None = None,
         disable_recompute: bool = False,
         cp_context: FLACPContext | None = None,
+        return_intermediate_states: bool = False,
     ):
         # Due to gate numerical stability consideration, we only support chunk_size=16 when safe_gate=True
         # And in practice, chunk_size=16 is sufficient for no safe gate situations.
@@ -176,7 +178,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         # chunk_dplr_fwd returns the possibly CP-merged + compressed initial_state;
         # for CP this is the [1, HV, K, V] state we must save for backward so the
         # forward recomputation can rebuild the correct per-rank h.
-        o, final_state, initial_state, cache = chunk_dplr_fwd(
+        o, final_state, initial_state, cache, h = chunk_dplr_fwd(
             q=q,
             k=k,
             v=v,
@@ -193,6 +195,12 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
             disable_recompute=disable_recompute,
             cp_context=cp_context,
         )
+
+        if return_intermediate_states:
+            assert disable_recompute is False, (
+                "return_intermediate_states must be used with disable_recompute=False"
+            )
+            return o.to(q.dtype), final_state, h
 
         if disable_recompute:
             gi, ge, A_qk, A_qb, A_ak, qg, kg, ag, bg, w, h, v_new, A_ab_inv = cache
@@ -236,6 +244,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         ctx,
         do: torch.Tensor,
         dht: torch.Tensor,
+        dh: torch.Tensor | None = None,
     ):
         if ctx.disable_recompute:
             (
@@ -434,7 +443,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
 
         return (
             dq.to(q), dk.to(k), dv.to(v), da.to(a), db.to(b), dgk.to(gk),
-            None, dh0, None, None, None, None, None, None, None,
+            None, dh0, None, None, None, None, None, None, None, None,
         )
 
 
@@ -455,6 +464,7 @@ def chunk_dplr_delta_rule(
     chunk_size: int | None = None,
     disable_recompute: bool = False,
     cp_context: FLACPContext | None = None,
+    return_intermediate_states: bool = False,
     **kwargs,
 ):
     r"""
@@ -497,12 +507,17 @@ def chunk_dplr_delta_rule(
             Context parallel context for distributed training across multiple devices.
             When provided, `initial_state` and `output_final_state` are not supported.
             Default: `None`.
+        return_intermediate_states (Optional[bool]):
+            Whether to return the recurrent state at the beginning of each physical chunk.
+            This is only supported when gradient calculation is disabled. Default: `False`.
 
     Returns:
         o (torch.Tensor):
             Outputs of shape `[B, T, H, V]`.
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+        intermediate_states (torch.Tensor, Optional):
+            Recurrent states at physical chunk boundaries when `return_intermediate_states=True`.
     """
     if q.dtype == torch.float32:
         warnings.warn(
@@ -522,6 +537,10 @@ def chunk_dplr_delta_rule(
         cu_seqlens = cp_context.cu_seqlens
         if cp_context.cu_seqlens_cpu is not None:
             cu_seqlens_cpu = cp_context.cu_seqlens_cpu
+    if return_intermediate_states:
+        assert not torch.is_grad_enabled(), (
+            "return_intermediate_states requires gradients to be disabled"
+        )
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -534,7 +553,7 @@ def chunk_dplr_delta_rule(
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
     scale = k.shape[-1] ** -0.5 if scale is None else scale
-    o, final_state = ChunkDPLRDeltaRuleFunction.apply(
+    result = ChunkDPLRDeltaRuleFunction.apply(
         q,
         k,
         v,
@@ -550,5 +569,6 @@ def chunk_dplr_delta_rule(
         chunk_size,
         disable_recompute,
         cp_context,
+        return_intermediate_states,
     )
-    return o, final_state
+    return result

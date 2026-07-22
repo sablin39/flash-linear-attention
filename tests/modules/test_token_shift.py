@@ -178,3 +178,38 @@ def test_token_shift_varlen_long_kernel_matches_reference():
 
     assert_close(" x", ref, tri, 1e-3)
     assert_close("dx", ref_dx, tri_dx, 1e-3)
+
+
+def test_token_shift_varlen_cache_when_sequence_count_equals_length():
+    num_sequences, sequence_length, hidden_size = 16, 16, 32
+    total_tokens = num_sequences * sequence_length
+    torch.manual_seed(42)
+
+    cu_seqlens = torch.arange(
+        0,
+        total_tokens + 1,
+        sequence_length,
+        dtype=torch.long,
+        device=device,
+    )
+    x = torch.randn(1, total_tokens, hidden_size, device=device)
+    cache = torch.randn(num_sequences, hidden_size, device=device)
+
+    ref = torch.empty_like(x)
+    ref_cache = torch.empty_like(cache)
+    for i in range(num_sequences):
+        start = i * sequence_length
+        end = start + sequence_length
+        ref[0, start] = cache[i] - x[0, start]
+        ref[0, start + 1:end] = x[0, start:end - 1] - x[0, start + 1:end]
+        ref_cache[i] = x[0, end - 1]
+
+    tri, tri_cache = token_shift(
+        x,
+        cu_seqlens=cu_seqlens,
+        cache=cache,
+        output_cache=True,
+    )
+
+    assert_close(" x", ref, tri, 1e-3)
+    assert_close("cache", ref_cache, tri_cache, 1e-3)

@@ -409,7 +409,7 @@ def token_shift_fwd(
             N = B
         BD = triton.next_power_of_2(D)
         grid = (N, T)
-        IS_DECODE = T == 1 or (B == 1 and T == N)
+        IS_DECODE = T == 1
         token_shift_fwd_kernel_short[grid](
             x=x,
             y=y,
