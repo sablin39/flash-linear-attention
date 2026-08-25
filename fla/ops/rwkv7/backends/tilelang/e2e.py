@@ -31,19 +31,30 @@ without cudagraphs) — and (2) keep one Cache alive for the whole compiled
 session; allocating fresh state buffers mid-session forces a costly cudagraph
 re-record. This mirrors HF's StaticCache serving pattern.
 
-Known limitation (training): compile with default mode or
-mode="max-autotune-no-cudagraphs". Plain mode="max-autotune" engages
-cudagraph trees, whose warmup run routes allocations into a private pool and
-then asserts every live pool block is a graph output; non-reentrant gradient
-checkpointing (_CheckpointFrame) keeps saved activations alive across that
-boundary without owning them as outputs, so the run fails with "tensor(s) in
-the cudagraph pool not tracked as outputs". Do NOT silence this with
-triton.slow_path_cudagraph_asserts=False: replay would overwrite the stashed
-activations before backward reads them (silent gradient corruption). The
-no-cudagraphs training config is unaffected and was already the faster one.
+Training with gradient checkpointing: every TileLang custom op returns
+exactly one tensor, so no raw output tuple can escape cudagraph trees' flat
+output tracking across an inductor cudagraph partition boundary ("tensor(s)
+in the cudagraph pool not tracked as outputs"). The DPLR chunk ops keep
+their cudagraph_unsafe tags, so training graphs always contain
+cudagraph-unsafe ops — and torch 2.13's partition codegen can corrupt the
+wrapper around such boundaries at scale (phantom buffer names in the
+generated call glue; 24 layers + non-reentrant checkpointing +
+mode="max-autotune"; disabling the partition reorder passes does not help).
+patch_e2e_namespace therefore forces
+torch._inductor.config.graph_partition=False unless the user set it
+explicitly: graphs with unsafe ops then run outside cudagraphs under every
+mode instead of being miscompiled, which for training was already the
+faster configuration anyway (max-autotune-no-cudagraphs). The trade-off is
+decode: without partitioning, a decode graph containing any dynamic shape
+is re-recorded per size instead of capturing its static layer stack once
+(31 vs 281 tok/s in the 1.5B B1 decode bench). Decode-only serving should
+set torch._inductor.config.graph_partition=True explicitly — the pin
+respects that override — but not in the same process as checkpointed
+max-autotune training, which would be miscompiled.
 """
 
 import os
+import warnings
 
 import torch
 
@@ -61,6 +72,34 @@ def patch_e2e_namespace(ns: dict) -> None:
     from fla.ops.rwkv7.backends.tilelang import RWKV7TileLangBackend
     if not RWKV7TileLangBackend.is_available():
         return
+
+    # torch 2.13's inductor graph-partition codegen can corrupt the wrapper
+    # around cudagraph-unsafe ops at scale (phantom buffer names in the
+    # generated call glue; seen with 24 layers + non-reentrant checkpointing
+    # + mode="max-autotune"; not avoided by disabling the partition reorder
+    # passes). The DPLR chunk ops keep their cudagraph_unsafe tags, so
+    # training graphs always contain unsafe ops; with partitioning disabled,
+    # inductor excludes those graphs from cudagraphs instead of miscompiling
+    # them — which for training was already the faster configuration. The
+    # cost is decode: an unpartitioned decode graph with any dynamic shape
+    # gets its cudagraph re-recorded per size, so decode-only users who want
+    # capture should set the config back explicitly. An explicit user
+    # override of the config is respected.
+    import torch._inductor.config as _inductor_cfg
+    if (
+        "graph_partition" in getattr(_inductor_cfg, "_config", {})
+        and _inductor_cfg.graph_partition
+        and _inductor_cfg._is_default("graph_partition")
+    ):
+        _inductor_cfg.graph_partition = False
+        warnings.warn(
+            f"{ENV_VAR}=1: torch._inductor.config.graph_partition disabled — "
+            "torch 2.13's cudagraph partition codegen can miscompile graphs "
+            "with cudagraph-unsafe ops at scale. Training is unaffected; "
+            "decode graphs with dynamic shapes lose cudagraph capture — "
+            "set the config explicitly to override (safe for decode-only "
+            "serving, unsafe combined with checkpointed training)."
+        )
 
     from fla.ops.generalized_delta_rule.dplr.backends.tilelang.chunk import (
         chunk_dplr_delta_rule_tilelang,

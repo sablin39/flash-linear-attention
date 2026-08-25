@@ -13,11 +13,18 @@ Two execution paths, both free of data-dependent shapes and host syncs:
 
 - Rectangular input with rect_T >= _MIN_INKERNEL_T: a single kernel owns
   everything — sequence-start rows (t % T_seq == 0) take x[t-1] from `cache`
-  (or 0), the last row of each sequence is written to `cache_out`.
+  (or 0).
 - Otherwise (varlen or small T): the kernel does the bulk flat
   shift-and-subtract on the (N_total, D) layout and the wrapper applies
-  per-sequence boundary fix-ups + cache_out extraction with
-  index_select/index_copy_, whose shapes follow from cu_seqlens.shape alone.
+  per-sequence boundary fix-ups with index_copy_, whose shapes follow from
+  cu_seqlens.shape alone.
+
+The optional cache_out (last row per sequence) and its gradient are plain
+aten gather/scatter outside the custom op, so both ops return exactly one
+tensor. A multi-output op whose raw tuple crosses a torch.compile cudagraph
+partition boundary is invisible to cudagraph trees' flat output tracking and
+trips "tensor(s) in the cudagraph pool not tracked as outputs" (seen with
+non-reentrant gradient checkpointing + mode="max-autotune").
 
 Unlike fla.modules.token_shift (Triton), this path needs no
 prepare_chunk_indices (data-dependent output length) and no runtime SM-count
@@ -44,7 +51,7 @@ def _cfg(D: int) -> dict[str, int]:
 
 
 @tilelang.jit(
-    out_idx=[2, 3],
+    out_idx=[2],
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
 def _token_shift_fwd_kernel(N_total, D, T_seq, in_dtype, HAS_CACHE: bool,
@@ -56,7 +63,6 @@ def _token_shift_fwd_kernel(N_total, D, T_seq, in_dtype, HAS_CACHE: bool,
         x: T.Tensor((N_total, D), in_dtype),
         cache: T.Tensor((nseq, D), in_dtype),
         y: T.Tensor((N_total, D), in_dtype),
-        cache_out: T.Tensor((nseq, D), in_dtype),
     ):
         with T.Kernel(T.ceildiv(N_total, BT), T.ceildiv(D, BD), threads=threads) as (i_t, i_d):
             for kt, kd in T.Parallel(BT, BD):
@@ -70,26 +76,20 @@ def _token_shift_fwd_kernel(N_total, D, T_seq, in_dtype, HAS_CACHE: bool,
                             y[t, d] = -x[t, d]
                     else:
                         y[t, d] = x[t - 1, d] - x[t, d]
-                    if t % T_seq == T_seq - 1:
-                        cache_out[t // T_seq, d] = x[t, d]
 
     return token_shift_fwd_tl
 
 
 @tilelang.jit(
-    out_idx=[2, 3],
+    out_idx=[1],
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
-def _token_shift_bwd_kernel(N_total, D, T_seq, in_dtype, HAS_DCACHE: bool,
+def _token_shift_bwd_kernel(N_total, D, T_seq, in_dtype,
                             BT: int = 16, BD: int = 256, threads: int = 512):
-    nseq = N_total // T_seq
-
     @T.prim_func
     def token_shift_bwd_tl(
         dy: T.Tensor((N_total, D), in_dtype),
-        dcache: T.Tensor((nseq, D), in_dtype),
         dx: T.Tensor((N_total, D), in_dtype),
-        grad_cache: T.Tensor((nseq, D), in_dtype),
     ):
         with T.Kernel(T.ceildiv(N_total, BT), T.ceildiv(D, BD), threads=threads) as (i_t, i_d):
             for kt, kd in T.Parallel(BT, BD):
@@ -97,14 +97,9 @@ def _token_shift_bwd_kernel(N_total, D, T_seq, in_dtype, HAS_DCACHE: bool,
                 d = i_d * BD + kd
                 if (t < N_total) and (d < D):
                     if t % T_seq == T_seq - 1:
-                        if HAS_DCACHE:
-                            dx[t, d] = -dy[t, d] + dcache[t // T_seq, d]
-                        else:
-                            dx[t, d] = -dy[t, d]
+                        dx[t, d] = -dy[t, d]
                     else:
                         dx[t, d] = -dy[t, d] + dy[t + 1, d]
-                    if t % T_seq == 0:
-                        grad_cache[t // T_seq, d] = dy[t, d]
 
     return token_shift_bwd_tl
 
@@ -148,15 +143,14 @@ def _zero_dummy(nseq: int, D: int, ref: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "fla::token_shift_rwkv7",
     mutates_args=(),
-    schema="(Tensor x, Tensor cu_seqlens, Tensor? cache, bool output_cache, int rect_T) -> (Tensor, Tensor?)",
+    schema="(Tensor x, Tensor cu_seqlens, Tensor? cache, int rect_T) -> Tensor",
 )
 def _token_shift_op(
     x: Tensor,
     cu_seqlens: Tensor,
     cache: Tensor | None,
-    output_cache: bool,
     rect_T: int,
-):
+) -> Tensor:
     assert x.dim() == 3, "Input must be [B, T, D]"
     _, _, D = x.shape
     active_nseq = cu_seqlens.numel() - 1
@@ -171,13 +165,12 @@ def _token_shift_op(
         cache_flat = cache.to(x.dtype) if has_cache else _zero_dummy(N_total // T_seq, D, x_flat)
         key = ("fwd", N_total, D, T_seq, _dtype_str(x), has_cache)
         kernel = _cached_kernel(key, lambda: _token_shift_fwd_kernel(N_total, D, T_seq, _dtype_str(x), has_cache, **_cfg(D)))
-        y_flat, cache_out = kernel(x_flat, cache_flat)
-        y = y_flat.view(*x.shape)
-        return y, (cache_out if output_cache else None)
+        y_flat = kernel(x_flat, cache_flat)
+        return y_flat.view(*x.shape)
 
     key = ("fwd", N_total, D, N_total, _dtype_str(x), False)
     kernel = _cached_kernel(key, lambda: _token_shift_fwd_kernel(N_total, D, N_total, _dtype_str(x), False, **_cfg(D)))
-    y_flat, _ = kernel(x_flat, _zero_dummy(1, D, x_flat))
+    y_flat = kernel(x_flat, _zero_dummy(1, D, x_flat))
 
     bos = cu_seqlens[:-1].to(torch.long)
     x_bos = x_flat.index_select(0, bos)
@@ -186,88 +179,69 @@ def _token_shift_op(
         y_flat.index_copy_(0, bos, cache_2d - x_bos)
     else:
         y_flat.index_copy_(0, bos, -x_bos)
-
-    y = y_flat.view(*x.shape)
-    if output_cache:
-        eos_minus_1 = (cu_seqlens[1:] - 1).to(torch.long)
-        cache_out = x_flat.index_select(0, eos_minus_1).contiguous()
-        return y, cache_out
-    return y, None
+    return y_flat.view(*x.shape)
 
 
 @_token_shift_op.register_fake
-def _token_shift_fake(x, cu_seqlens, cache, output_cache: bool, rect_T: int):
-    cache_out = None
-    if output_cache:
-        cache_out = x.new_empty((cu_seqlens.shape[0] - 1, x.shape[-1]))
-    return x.new_empty(x.shape), cache_out
+def _token_shift_fake(x, cu_seqlens, cache, rect_T: int):
+    return x.new_empty(x.shape)
 
 
 @torch.library.custom_op(
     "fla::token_shift_rwkv7_bwd",
     mutates_args=(),
-    schema="(Tensor dy, Tensor cu_seqlens, Tensor? dcache, bool has_cache, int rect_T) -> (Tensor, Tensor?)",
+    schema="(Tensor dy, Tensor cu_seqlens, int rect_T) -> Tensor",
 )
 def _token_shift_bwd_op(
     dy: Tensor,
     cu_seqlens: Tensor,
-    dcache: Tensor | None,
-    has_cache: bool,
     rect_T: int,
-):
+) -> Tensor:
     _, _, D = dy.shape
     dy_flat = dy.reshape(-1, D).contiguous()
     N_total = dy_flat.shape[0]
     dtype_str = _dtype_str(dy)
 
     if rect_T >= _MIN_INKERNEL_T:
-        nseq = N_total // rect_T
-        has_dcache = dcache is not None
-        dc_flat = dcache.reshape(nseq, D).to(dy.dtype) if has_dcache else _zero_dummy(nseq, D, dy_flat)
-        key = ("bwd", N_total, D, rect_T, dtype_str, has_dcache)
-        kernel = _cached_kernel(key, lambda: _token_shift_bwd_kernel(N_total, D, rect_T, dtype_str, has_dcache, **_cfg(D)))
-        dx_flat, grad_cache = kernel(dy_flat, dc_flat)
-        return dx_flat.view_as(dy), (grad_cache if has_cache else None)
+        key = ("bwd", N_total, D, rect_T, dtype_str)
+        kernel = _cached_kernel(key, lambda: _token_shift_bwd_kernel(N_total, D, rect_T, dtype_str, **_cfg(D)))
+        dx_flat = kernel(dy_flat)
+        return dx_flat.view_as(dy)
 
-    key = ("bwd", N_total, D, N_total, dtype_str, False)
-    kernel = _cached_kernel(key, lambda: _token_shift_bwd_kernel(N_total, D, N_total, dtype_str, False, **_cfg(D)))
-    dx_flat, _ = kernel(dy_flat, _zero_dummy(1, D, dy_flat))
+    key = ("bwd", N_total, D, N_total, dtype_str)
+    kernel = _cached_kernel(key, lambda: _token_shift_bwd_kernel(N_total, D, N_total, dtype_str, **_cfg(D)))
+    dx_flat = kernel(dy_flat)
 
-    active_nseq = cu_seqlens.numel() - 1
+    # per-sequence last rows take -dy; the in-kernel T_seq == N_total run only
+    # gets the global last row right, so fix the rest here
     eos_minus_1 = (cu_seqlens[1:] - 1).to(torch.long)
     dy_eos = dy_flat.index_select(0, eos_minus_1)
-    if dcache is not None:
-        dc = dcache.reshape(active_nseq, D).to(dy.dtype)
-        dx_flat.index_copy_(0, eos_minus_1, -dy_eos + dc)
-    else:
-        dx_flat.index_copy_(0, eos_minus_1, -dy_eos)
-
-    grad_cache = None
-    if has_cache:
-        bos = cu_seqlens[:-1].to(torch.long)
-        grad_cache = dy_flat.index_select(0, bos).contiguous()
-    return dx_flat.view_as(dy), grad_cache
+    dx_flat.index_copy_(0, eos_minus_1, -dy_eos)
+    return dx_flat.view_as(dy)
 
 
 @_token_shift_bwd_op.register_fake
-def _token_shift_bwd_fake(dy, cu_seqlens, dcache, has_cache: bool, rect_T: int):
-    grad_cache = None
-    if has_cache:
-        grad_cache = dy.new_empty((cu_seqlens.shape[0] - 1, dy.shape[-1]))
-    return dy.new_empty(dy.shape), grad_cache
+def _token_shift_bwd_fake(dy, cu_seqlens, rect_T: int):
+    return dy.new_empty(dy.shape)
 
 
 def _token_shift_setup_context(ctx, inputs, output):
-    _, cu_seqlens, cache, output_cache, rect_T = inputs
+    _, cu_seqlens, cache, rect_T = inputs
     ctx.save_for_backward(cu_seqlens)
     ctx.has_cache = cache is not None
     ctx.rect_T = rect_T
 
 
-def _token_shift_backward(ctx, dy: torch.Tensor, dcache_out: torch.Tensor | None):
+def _token_shift_backward(ctx, dy: torch.Tensor):
     (cu,) = ctx.saved_tensors
-    dx, grad_cache = _token_shift_bwd_op(dy, cu, dcache_out, ctx.has_cache, ctx.rect_T)
-    return dx, None, grad_cache, None, None
+    dx = _token_shift_bwd_op(dy, cu, ctx.rect_T)
+    grad_cache = None
+    if ctx.has_cache:
+        # y[bos] = cache - x[bos] -> d_cache = dy[bos]; the cache_out gather in
+        # the wrapper scatters dcache_out into dx at the eos rows on its own
+        bos = cu[:-1].to(torch.long)
+        grad_cache = dy.reshape(-1, dy.shape[-1]).index_select(0, bos)
+    return dx, None, grad_cache, None
 
 
 _token_shift_op.register_autograd(
@@ -309,7 +283,13 @@ def token_shift_tilelang(
 
     cu = _normalize_cu_seqlens(x, cu_seqlens)
     rect_T = x.shape[1] if cu_seqlens is None else 0
-    y, cache_out = _token_shift_op(x, cu, cache, output_cache, rect_T)
+    y = _token_shift_op(x, cu, cache, rect_T)
+    cache_out = None
+    if output_cache:
+        # last row of each sequence; plain aten gather so autograd scatters
+        # its grad back into x without crossing the custom-op boundary
+        eos = cu[1:] - 1
+        cache_out = x.reshape(-1, x.shape[-1]).index_select(0, eos)
     if (orig_cache is not None and cache_out is not None and rect_T == 1
             and cache.is_contiguous() and cache.dtype == x.dtype
             and not (torch.is_grad_enabled() and cache.requires_grad)):
