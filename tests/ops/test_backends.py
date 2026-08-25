@@ -20,6 +20,7 @@ from fla.ops.common.backends import tilelang as common_tilelang_backend
 from fla.ops.generalized_delta_rule.dplr.backends import tilelang as dplr_tilelang_backend
 from fla.ops.kda.backends import tilelang as kda_tilelang_backend
 from fla.ops.rwkv6.backends import tilelang as rwkv6_tilelang_backend
+from fla.ops.rwkv7.backends import tilelang as rwkv7_tilelang_backend
 from fla.ops.simple_gla.backends.triton_ascend.utils import simple_gla_verifier
 from fla.utils import env
 
@@ -29,6 +30,7 @@ _TILELANG_BACKENDS = [
     pytest.param(common_tilelang_backend.CommonTileLangBackend, id='common'),
     pytest.param(kda_tilelang_backend.KDATileLangBackend, id='kda'),
     pytest.param(rwkv6_tilelang_backend.RWKV6TileLangBackend, id='rwkv6'),
+    pytest.param(rwkv7_tilelang_backend.RWKV7TileLangBackend, id='rwkv7'),
     pytest.param(dplr_tilelang_backend.DPLRTileLangBackend, id='dplr'),
 ]
 
@@ -224,6 +226,7 @@ def test_tilelang_backend_unavailable_without_tilelang(monkeypatch, backend_clas
         ),
         pytest.param(kda_tilelang_backend.KDATileLangBackend, True, id='kda'),
         pytest.param(rwkv6_tilelang_backend.RWKV6TileLangBackend, False, id='rwkv6'),
+        pytest.param(rwkv7_tilelang_backend.RWKV7TileLangBackend, True, id='rwkv7'),
         pytest.param(dplr_tilelang_backend.DPLRTileLangBackend, True, id='dplr'),
     ],
 )

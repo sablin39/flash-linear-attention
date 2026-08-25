@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.backends import dispatch
 from fla.ops.generalized_delta_rule import fused_recurrent_dplr_delta_rule
 from fla.ops.utils.op import exp
 from fla.utils import autotune_cache_kwargs, input_guard
@@ -235,6 +236,7 @@ def fused_recurrent_rwkv7(
     )
 
 
+@dispatch('rwkv7')
 def fused_mul_recurrent_rwkv7(
     r: torch.Tensor,
     w: torch.Tensor,

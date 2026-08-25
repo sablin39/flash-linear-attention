@@ -26,6 +26,10 @@ from fla.models.rwkv7.configuration_rwkv7 import RWKV7Config
 from fla.modules import LayerNorm
 from fla.modules.activations import ACT2FN
 from fla.modules.token_shift import token_shift
+from fla.ops.rwkv7.backends.tilelang.e2e import patch_e2e_namespace as _patch_e2e_namespace
+
+# opt-in (FLA_RWKV7_TILELANG_E2E=1): rebind token_shift to the TileLang custom op
+_patch_e2e_namespace(globals())
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack

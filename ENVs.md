@@ -60,6 +60,24 @@ Gluon switches apply to the `triton` path. They do not select the convolution ba
 | `FLA_USE_TMA`     | `0`     | `0` / `1`                                 | Allow TMA kernels on NVIDIA Hopper/Blackwell and AMD gfx1250, subject to Triton support and input constraints. |
 | `FLA_USE_COMPILE` | `1`     | `0` / `1`, `true` / `false`, `yes` / `no` | Enable `torch.compile` for RWKV7 fused addcmul. Case-insensitive; disabled on Python < 3.11.                   |
 
+---
+
+## Operator backend dispatch
+
+FLA can dispatch certain ops to specialized backends (TileLang, FlashKDA, intra-card CP).
+Each backend is gated by a single env var below.
+
+| Variable                       | Default     | Options    | Description                                                                                                                              |
+| ------------------------------ | ----------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `FLA_DISABLE_BACKEND_DISPATCH` | unset (`0`) | `0` / `1`  | Master switch. Set to `1` to bypass *all* backend dispatch and always use the default Triton implementation. Useful for debugging.       |
+| `FLA_TILELANG`                 | unset (`1`) | `0` / `1`  | Enable the TileLang backend when the `tilelang` package is installed. Set to `0` to force the Triton path (e.g. to work around #640).    |
+| `FLA_RWKV7_TILELANG_E2E`       | unset (`0`) | `0` / `1`  | Opt in to the TileLang end-to-end RWKV7 path: `fla.layers.rwkv7` / `fla.models.rwkv7` call TileLang custom ops directly instead of the dispatched (and `torch.compiler.disable`'d) wrappers, so `torch.compile(fullgraph=True)` trains and decodes without graph breaks. Decode (T==1) keeps its conv/recurrent states in static-address buffers updated in place, so `mode="reduce-overhead"` can capture cudagraphs. Training: use default mode or `max-autotune-no-cudagraphs`; plain `max-autotune` + gradient checkpointing trips a cudagraph-trees pool-ownership check (see the e2e module docstring). |
+| `FLA_FLASH_KDA`                | unset (`1`) | `0` / `1`  | Enable the [FlashKDA](https://github.com/MoonshotAI/FlashKDA) CUTLASS forward for `chunk_kda` (inference only). Requires `flash_kda`.    |
+| `FLA_INTRACARD_CP`             | unset (`0`) | `0` / `1`  | Opt in to the intra-card context-parallel backend for shared delta-rule ops (`chunk_gated_delta_rule_fwd_h`). Inference + varlen only.  |
+| `FLA_INTRACARD_MAX_SPLITS`     | `32`        | int ≥ 1    | Max number of sub-sequences per original sequence used by the intra-card CP backend. Caps merge-chain depth to control precision loss.  |
+
+---
+
 ## Autotune & config cache
 
 | Variable                   | Default       | Options                         | Description                                                       |
