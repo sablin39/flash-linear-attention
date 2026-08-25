@@ -268,7 +268,7 @@ def _gate_output_correction_bwd_op(
     r_k: Tensor,
     v: Tensor,
     g: Tensor,
-) -> Tensor:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     B, T_, H, D = r.shape
     M = B * T_
     S = max(1, min(64, M // 2048))
@@ -286,24 +286,27 @@ def _gate_output_correction_bwd_op(
         dy_c, o_c, r_c, k_c, r_k_c, v_c, g_c,
     )
     d_rk = d_rk_part.sum(dim=0).to(r_k.dtype)
-    # single flat output: a raw multi-output tuple crossing a torch.compile
-    # cudagraph partition boundary escapes cudagraph trees' flat output
-    # tracking ("tensor(s) in the cudagraph pool not tracked as outputs"), and
-    # tagging the op cudagraph_unsafe trips an inductor partition codegen bug
-    # at scale (phantom buffer names in the generated wrapper, torch 2.13)
-    return torch.cat(tuple(t.reshape(-1) for t in (d_o, d_r, d_k, d_rk, d_v, d_g)))
+    return (
+        d_o.view(B, T_, H * D), d_r.view(B, T_, H, D), d_k.view(B, T_, H, D),
+        d_rk, d_v.view(B, T_, H, D), d_g.view(B, T_, H * D),
+    )
 
 
 @_gate_output_correction_bwd_op.register_fake
 def _gate_output_correction_bwd_fake(dy, o, r, k, r_k, v, g):
-    return o.new_empty(sum(t.numel() for t in (o, r, k, r_k, v, g)))
+    return (
+        o.new_empty(o.shape),
+        r.new_empty(r.shape),
+        k.new_empty(k.shape),
+        r_k.new_empty(r_k.shape),
+        v.new_empty(v.shape),
+        g.new_empty(g.shape),
+    )
 
 
 def _gate_output_correction_backward(ctx, dy):
     o, r, k, r_k, v, g = ctx.saved_tensors
-    packed = _gate_output_correction_bwd_op(dy, o, r, k, r_k, v, g)
-    outs = torch.split(packed, [t.numel() for t in (o, r, k, r_k, v, g)])
-    return tuple(s.view_as(t) for s, t in zip(outs, (o, r, k, r_k, v, g)))
+    return _gate_output_correction_bwd_op(dy, o, r, k, r_k, v, g)
 
 
 _gate_output_correction_op.register_autograd(

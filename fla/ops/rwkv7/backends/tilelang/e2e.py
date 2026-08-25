@@ -31,26 +31,29 @@ without cudagraphs) — and (2) keep one Cache alive for the whole compiled
 session; allocating fresh state buffers mid-session forces a costly cudagraph
 re-record. This mirrors HF's StaticCache serving pattern.
 
-Training with gradient checkpointing: every TileLang custom op returns
-exactly one tensor, so no raw output tuple can escape cudagraph trees' flat
-output tracking across an inductor cudagraph partition boundary ("tensor(s)
-in the cudagraph pool not tracked as outputs"). The DPLR chunk ops keep
-their cudagraph_unsafe tags, so training graphs always contain
-cudagraph-unsafe ops — and torch 2.13's partition codegen can corrupt the
-wrapper around such boundaries at scale (phantom buffer names in the
-generated call glue; 24 layers + non-reentrant checkpointing +
-mode="max-autotune"; disabling the partition reorder passes does not help).
+Training with gradient checkpointing: the DPLR chunk ops carry
+cudagraph_unsafe tags, so training graphs always contain cudagraph-unsafe
+ops. torch 2.13's inductor graph-partition codegen miscompiles such graphs
+at scale (phantom buffer names in the generated call glue — 24 layers +
+non-reentrant checkpointing + mode="max-autotune"; disabling the partition
+reorder passes does not help), and even where it compiles, a partition
+boundary lets checkpoint-saved state cross into the cudagraph pool
+untracked ("tensor(s) in the cudagraph pool not tracked as outputs").
 patch_e2e_namespace therefore forces
 torch._inductor.config.graph_partition=False unless the user set it
-explicitly: graphs with unsafe ops then run outside cudagraphs under every
-mode instead of being miscompiled, which for training was already the
-faster configuration anyway (max-autotune-no-cudagraphs). The trade-off is
+explicitly: the whole training graph is then excluded from cudagraph trees
+instead of being miscompiled, which was already the faster training
+configuration anyway (max-autotune-no-cudagraphs). The trade-off is
 decode: without partitioning, a decode graph containing any dynamic shape
 is re-recorded per size instead of capturing its static layer stack once
 (31 vs 281 tok/s in the 1.5B B1 decode bench). Decode-only serving should
 set torch._inductor.config.graph_partition=True explicitly — the pin
 respects that override — but not in the same process as checkpointed
-max-autotune training, which would be miscompiled.
+max-autotune training, which would be miscompiled. If the pin is lifted on
+a fixed torch, tuple op outputs crossing a partition boundary re-trip the
+pool check; the single-tensor-output packing of commit 305f1142 avoids
+that but unions output buffer lifetimes (+47 GiB peak at 1.5B B8 T4096
+ckpt), so it was reverted rather than kept as insurance.
 """
 
 import os

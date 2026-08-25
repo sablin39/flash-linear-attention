@@ -18,10 +18,7 @@ layer's default fuse_norm=False path and the official RWKV reference.
 
 Forward and backward are both opaque custom ops so AOTAutograd never traces
 into TileLang JIT calls; the ops are capture-safe (no input mutation, no
-data-dependent shapes). Both return exactly one tensor (the forward packs
-(k_new, neg_kk, kka) into (3, N, D), the backward one flat buffer): a raw
-multi-output tuple crossing a cudagraph partition boundary escapes cudagraph
-trees' flat output tracking.
+data-dependent shapes) and stay inside cudagraph trees.
 """
 
 from __future__ import annotations
@@ -39,7 +36,7 @@ def _fwd_cfg(N: int, D: int) -> dict[str, int]:
 
 
 @tilelang.jit(
-    out_idx=[4],
+    out_idx=[4, 5, 6],
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
 def _kk_pre_fwd_kernel(N, H, D, in_dtype, BR: int = 4, threads: int = 256):
@@ -53,11 +50,9 @@ def _kk_pre_fwd_kernel(N, H, D, in_dtype, BR: int = 4, threads: int = 256):
         a: T.Tensor((N, D), in_dtype),
         k_k: T.Tensor((H, D), in_dtype),
         k_a: T.Tensor((H, D), in_dtype),
-        # (k_new, neg_kk, kka) packed into one buffer: a custom op returning a
-        # raw tuple can have that tuple passed across a torch.compile cudagraph
-        # partition boundary, where cudagraph trees only tracks flat outputs
-        # and raises "tensor(s) in the cudagraph pool not tracked as outputs"
-        o: T.Tensor((3, N, D), in_dtype),
+        k_new: T.Tensor((N, D), in_dtype),
+        neg_kk: T.Tensor((N, D), in_dtype),
+        kka: T.Tensor((N, D), in_dtype),
     ):
         with T.Kernel(T.ceildiv(N, BR), threads=threads) as i_b:
             scaled = T.alloc_fragment((BR, D), acc_dtype)
@@ -73,7 +68,7 @@ def _kk_pre_fwd_kernel(N, H, D, in_dtype, BR: int = 4, threads: int = 256):
                     s = bk * T.Cast(acc_dtype, k_k[i_h, d])
                     scaled[r, d] = s
                     sq[r, d] = s * s
-                    o[0, i_n, d] = T.Cast(
+                    k_new[i_n, d] = T.Cast(
                         in_dtype, bk * (1.0 + (ba - 1.0) * T.Cast(acc_dtype, k_a[i_h, d])),
                     )
                 else:
@@ -91,8 +86,8 @@ def _kk_pre_fwd_kernel(N, H, D, in_dtype, BR: int = 4, threads: int = 256):
                         T.Cast(acc_dtype, inv_eps),
                     )
                     kk = scaled[r, d] * inv_norm
-                    o[1, i_n, d] = T.Cast(in_dtype, -kk)
-                    o[2, i_n, d] = T.Cast(in_dtype, kk * T.Cast(acc_dtype, a[i_n, d]))
+                    neg_kk[i_n, d] = T.Cast(in_dtype, -kk)
+                    kka[i_n, d] = T.Cast(in_dtype, kk * T.Cast(acc_dtype, a[i_n, d]))
 
     return kk_pre_fwd_tl
 
@@ -284,7 +279,7 @@ def _cached_kernel(key: tuple, builder):
 @torch.library.custom_op(
     "fla::kk_pre_rwkv7",
     mutates_args=(),
-    schema="(Tensor k, Tensor a, Tensor k_k, Tensor k_a, int head_dim) -> Tensor",
+    schema="(Tensor k, Tensor a, Tensor k_k, Tensor k_a, int head_dim) -> (Tensor, Tensor, Tensor)",
 )
 def _kk_pre_op(
     k: Tensor,
@@ -292,7 +287,7 @@ def _kk_pre_op(
     k_k: Tensor,
     k_a: Tensor,
     head_dim: int,
-) -> Tensor:
+) -> tuple[Tensor, Tensor, Tensor]:
     assert k.shape == a.shape
     D = int(head_dim)
     H = k.shape[-1] // D
@@ -308,15 +303,24 @@ def _kk_pre_op(
         key,
         lambda: _kk_pre_fwd_kernel(N, H, D, _dtype_str(k), **_fwd_cfg(N, D)),
     )
-    # (3, N, D): k_new, neg_kk, kka — one buffer so the op has a single
-    # (cudagraph-partition-safe) tensor output
-    return kernel(k_f, a_f, kk_w, ka_w)
+    k_new_f, neg_kk_f, kka_f = kernel(k_f, a_f, kk_w, ka_w)
+
+    head_shape = (*k.shape[:-1], H, D)
+    return (
+        k_new_f.view_as(k),
+        neg_kk_f.view(head_shape),
+        kka_f.view(head_shape),
+    )
 
 
 @_kk_pre_op.register_fake
 def _kk_pre_fake(k, a, k_k, k_a, head_dim: int):
-    N = k.numel() // head_dim
-    return k.new_empty((3, N, head_dim))
+    H = k.shape[-1] // head_dim
+    return (
+        k.new_empty(k.shape),
+        k.new_empty((*k.shape[:-1], H, head_dim)),
+        k.new_empty((*k.shape[:-1], H, head_dim)),
+    )
 
 
 def _kk_pre_setup_context(ctx, inputs, output):
@@ -331,7 +335,7 @@ def _kk_pre_setup_context(ctx, inputs, output):
     schema=(
         "(Tensor dk_new, Tensor dneg_kk, Tensor dkka, Tensor k, Tensor a, "
         "Tensor k_k, Tensor k_a, int head_dim, bool has_dk_new, "
-        "bool has_dneg_kk, bool has_dkka) -> Tensor"
+        "bool has_dneg_kk, bool has_dkka) -> (Tensor, Tensor, Tensor, Tensor)"
     ),
 )
 def _kk_pre_bwd_op(
@@ -346,7 +350,7 @@ def _kk_pre_bwd_op(
     has_dk_new: bool,
     has_dneg_kk: bool,
     has_dkka: bool,
-) -> Tensor:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     D = int(head_dim)
     H = k.shape[-1] // D
     flat_shape = (-1, H, D)
@@ -381,17 +385,12 @@ def _kk_pre_bwd_op(
     )
     grad_kk_w, grad_ka_w = reduce_kernel(grad_kk_partial, grad_ka_partial)
 
-    # single flat output: a raw multi-output tuple crossing a torch.compile
-    # cudagraph partition boundary escapes cudagraph trees' flat output
-    # tracking ("tensor(s) in the cudagraph pool not tracked as outputs"), and
-    # tagging the op cudagraph_unsafe trips an inductor partition codegen bug
-    # at scale (phantom buffer names in the generated wrapper, torch 2.13)
-    return torch.cat((
-        grad_k.reshape(-1).to(k.dtype),
-        grad_a.reshape(-1).to(a.dtype),
-        grad_kk_w.reshape(-1),
-        grad_ka_w.reshape(-1),
-    ))
+    return (
+        grad_k.reshape_as(k).to(k.dtype),
+        grad_a.reshape_as(a).to(a.dtype),
+        grad_kk_w.reshape(k_k.shape),
+        grad_ka_w.reshape(k_a.shape),
+    )
 
 
 @_kk_pre_bwd_op.register_fake
@@ -399,29 +398,32 @@ def _kk_pre_bwd_fake(
     dk_new, dneg_kk, dkka, k, a, k_k, k_a, head_dim,
     has_dk_new, has_dneg_kk, has_dkka,
 ):
-    return k.new_empty(sum(t.numel() for t in (k, a, k_k, k_a)))
+    return (
+        k.new_empty(k.shape),
+        a.new_empty(a.shape),
+        k_k.new_empty(k_k.shape),
+        k_a.new_empty(k_a.shape),
+    )
 
 
-def _kk_pre_backward(ctx, d_o: torch.Tensor):
+def _kk_pre_backward(ctx, dk_new, dneg_kk, dkka):
     k, a, k_k, k_a = ctx.saved_tensors
-    # the packed (3, N, D) output always comes back fully materialized
-    dk_new, dneg_kk, dkka = d_o.unbind(0)
-    packed = _kk_pre_bwd_op(
-        dk_new,
-        dneg_kk,
-        dkka,
+    has_dk_new = dk_new is not None
+    has_dneg_kk = dneg_kk is not None
+    has_dkka = dkka is not None
+    grad_k, grad_a, grad_kk_w, grad_ka_w = _kk_pre_bwd_op(
+        dk_new if has_dk_new else k,
+        dneg_kk if has_dneg_kk else k,
+        dkka if has_dkka else k,
         k,
         a,
         k_k,
         k_a,
         ctx.head_dim,
-        True,
-        True,
-        True,
+        has_dk_new,
+        has_dneg_kk,
+        has_dkka,
     )
-    saved = (k, a, k_k, k_a)
-    outs = torch.split(packed, [t.numel() for t in saved])
-    grad_k, grad_a, grad_kk_w, grad_ka_w = (s.view_as(t) for s, t in zip(outs, saved))
     return grad_k, grad_a, grad_kk_w, grad_ka_w, None
 
 
@@ -449,13 +451,4 @@ def kk_pre_rwkv7(
         neg_kk (..., H, D): ``-F.normalize(k * k_k, dim=-1)``.
         kka (..., H, D): ``F.normalize(k * k_k, dim=-1) * a``.
     """
-    D = int(head_dim)
-    H = k.shape[-1] // D
-    o = _kk_pre_op(k, a, k_k, k_a, D)
-    k_new, neg_kk, kka = o.unbind(0)
-    head_shape = (*k.shape[:-1], H, D)
-    return (
-        k_new.view_as(k),
-        neg_kk.view(head_shape),
-        kka.view(head_shape),
-    )
+    return _kk_pre_op(k, a, k_k, k_a, int(head_dim))

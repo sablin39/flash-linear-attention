@@ -409,7 +409,8 @@ def _gn_corr_setup_context(ctx, inputs, output):
     mutates_args=(),
     schema=(
         "(Tensor dy, Tensor o, Tensor r, Tensor k, Tensor r_k, Tensor v, Tensor g, "
-        "Tensor weight, Tensor bias, float eps) -> Tensor"
+        "Tensor weight, Tensor bias, float eps) -> "
+        "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
     ),
 )
 def _gn_corr_bwd_op(
@@ -423,7 +424,7 @@ def _gn_corr_bwd_op(
     weight: Tensor,
     bias: Tensor,
     eps: float,
-) -> Tensor:
+):
     B, T_, H, D = o.shape
     M = B * T_
     BT, threads = 8, 256
@@ -455,27 +456,38 @@ def _gn_corr_bwd_op(
     )
     d_weight_f, d_bias_f, d_rk = reduce_kernel(d_weight_partial, d_bias_partial, d_rk_partial)
 
-    # single flat output: a raw multi-output tuple crossing a torch.compile
-    # cudagraph partition boundary escapes cudagraph trees' flat output
-    # tracking ("tensor(s) in the cudagraph pool not tracked as outputs"), and
-    # tagging the op cudagraph_unsafe trips an inductor partition codegen bug
-    # at scale (phantom buffer names in the generated wrapper, torch 2.13)
-    return torch.cat(tuple(t.reshape(-1) for t in (
-        d_o_f, d_r_f, d_k_f, d_rk, d_v_f, d_g_f, d_weight_f, d_bias_f,
-    )))
+    return (
+        d_o_f.view_as(o),
+        d_r_f.view_as(r),
+        d_k_f.view_as(k),
+        d_rk.view_as(r_k),
+        d_v_f.view_as(v),
+        d_g_f.view(M, H, D).reshape(g.shape),
+        d_weight_f.reshape(weight.shape),
+        d_bias_f.reshape(bias.shape),
+    )
 
 
 @_gn_corr_bwd_op.register_fake
 def _gn_corr_bwd_fake(dy, o, r, k, r_k, v, g, weight, bias, eps):
-    return o.new_empty(sum(t.numel() for t in (o, r, k, r_k, v, g, weight, bias)))
+    return (
+        o.new_empty(o.shape),
+        r.new_empty(r.shape),
+        k.new_empty(k.shape),
+        r_k.new_empty(r_k.shape),
+        v.new_empty(v.shape),
+        g.new_empty(g.shape),
+        weight.new_empty(weight.shape),
+        bias.new_empty(bias.shape),
+    )
 
 
 def _gn_corr_backward(ctx, dy):
     o, r, k, r_k, v, g, weight, bias = ctx.saved_tensors
-    packed = _gn_corr_bwd_op(dy, o, r, k, r_k, v, g, weight, bias, ctx.eps)
-    saved = (o, r, k, r_k, v, g, weight, bias)
-    outs = torch.split(packed, [t.numel() for t in saved])
-    return tuple(s.view_as(t) for s, t in zip(outs, saved)) + (None,)
+    d_o, d_r, d_k, d_rk, d_v, d_g, d_weight, d_bias = _gn_corr_bwd_op(
+        dy, o, r, k, r_k, v, g, weight, bias, ctx.eps,
+    )
+    return d_o, d_r, d_k, d_rk, d_v, d_g, d_weight, d_bias, None
 
 
 _gn_corr_op.register_autograd(_gn_corr_backward, setup_context=_gn_corr_setup_context)
