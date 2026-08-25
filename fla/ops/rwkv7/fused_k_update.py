@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
 from fla.utils import IS_AMD, autotune_cache_kwargs, get_multiprocessor_count, input_guard
 
@@ -350,6 +351,7 @@ class KUpdateFunction(torch.autograd.Function):
         return dk, da, dka, None, None
 
 
+@dispatch('rwkv7')
 def fused_k_rwkv7(k, a, ka, cu_seqlens=None, cu_seqlens_cpu=None):
     if k.shape[1] == 1:
         return k_update_ref(k, a, ka)

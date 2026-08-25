@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.backends import dispatch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, input_guard
 
 
@@ -249,6 +250,7 @@ class GateOutputCorrection(torch.autograd.Function):
         return gate_output_correction_backward_triton(grad_output, o, r, k, r_k, v, g)
 
 
+@dispatch('rwkv7')
 @torch.compiler.disable
 def gate_output_correction(
     o: torch.Tensor,

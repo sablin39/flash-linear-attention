@@ -409,6 +409,7 @@ def _chunk_dplr_delta_rule_bwd_core(
 @torch.library.custom_op(
     "fla::chunk_dplr_delta_rule_bwd",
     mutates_args=(),
+    tags=(torch._C.Tag.cudagraph_unsafe,),
 )
 def _chunk_dplr_delta_rule_bwd_op(
     do: Tensor,
@@ -482,6 +483,7 @@ def _chunk_dplr_delta_rule_bwd_fake(
 @torch.library.custom_op(
     "fla::chunk_dplr_delta_rule_bwd_ctx",
     mutates_args=(),
+    tags=(torch._C.Tag.cudagraph_unsafe,),
 )
 def _chunk_dplr_delta_rule_bwd_ctx_op(
     do: Tensor,
@@ -593,6 +595,7 @@ def _chunk_dplr_delta_rule_bwd_ctx_fake(
 @torch.library.custom_op(
     "fla::chunk_dplr_delta_rule_fwd",
     mutates_args=(),
+    tags=(torch._C.Tag.cudagraph_unsafe,),
 )
 def _chunk_dplr_delta_rule_fwd_op(
     q: Tensor,
@@ -878,6 +881,7 @@ def _chunk_dplr_delta_rule_fwd_ctx_core(
 @torch.library.custom_op(
     "fla::chunk_dplr_delta_rule_fwd_ctx",
     mutates_args=(),
+    tags=(torch._C.Tag.cudagraph_unsafe,),
 )
 def _chunk_dplr_delta_rule_fwd_ctx_op(
     q: Tensor,
@@ -976,6 +980,7 @@ def _chunk_dplr_delta_rule_fwd_ctx_fake(
 @torch.library.custom_op(
     "fla::chunk_dplr_delta_rule_fwd_ctx_elided",
     mutates_args=(),
+    tags=(torch._C.Tag.cudagraph_unsafe,),
 )
 def _chunk_dplr_delta_rule_fwd_ctx_elided_op(
     q: Tensor,

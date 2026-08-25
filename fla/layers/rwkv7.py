@@ -21,12 +21,27 @@ from fla.modules import GroupNorm
 from fla.modules.l2norm import l2_norm
 from fla.modules.token_shift import token_shift
 from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
+from fla.ops.rwkv7.backends.tilelang.e2e import patch_e2e_namespace as _patch_e2e_namespace
 from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
 from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
 from fla.ops.rwkv7.gate_output_correction import gate_output_correction
 
+# flipped to True by _patch_e2e_namespace when FLA_RWKV7_TILELANG_E2E=1
+_TILELANG_E2E = False
+
+# opt-in (FLA_RWKV7_TILELANG_E2E=1): rebind the ops above to TileLang custom ops
+_patch_e2e_namespace(globals())
+
 if TYPE_CHECKING:
     from fla.models.utils import Cache
+
+    # injected into this module's globals by _patch_e2e_namespace when the
+    # TileLang e2e path is enabled; only referenced under `_TILELANG_E2E`.
+    # The noqa markers are needed because the runtime objects come from the
+    # injection; these imports only give the names a declarable type.
+    from fla.ops.rwkv7.backends.tilelang.decode import fused_recurrent_rwkv7_e2e  # noqa: TC004
+    from fla.ops.rwkv7.backends.tilelang.fused_gn_corr import gn_corr_rwkv7  # noqa: TC004
+    from fla.ops.rwkv7.backends.tilelang.kk_pre import kk_pre_rwkv7  # noqa: TC004
 
 
 class RWKV7Attention(nn.Module):
@@ -280,20 +295,24 @@ class RWKV7Attention(nn.Module):
         a = self.a_lora(xa).sigmoid()
         g = self.g_lora(xg)
 
-        if self.fuse_norm:
-            kk = l2_norm(rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim))
+        if _TILELANG_E2E:
+            # fused: k update + kk normalization + DPLR (neg_kk, kka) materialization
+            k, neg_kk, kka = kk_pre_rwkv7(k, a, self.k_k, self.k_a, self.head_dim)
         else:
-            kk = F.normalize(rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim), dim=-1, p=2.0)
+            if self.fuse_norm:
+                kk = l2_norm(rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim))
+            else:
+                kk = F.normalize(rearrange(k * self.k_k, 'b t (h d) -> b t h d', d=self.head_dim), dim=-1, p=2.0)
 
-        # Prefer addcmul over expanded form for numerical stability in bf16:
-        # 1. Fused Multiply-Add (FMA) in addcmul reduces intermediate rounding:
-        #    - Single op vs original 3 ops (mul, sub, mul)
-        #    - 1 less intermediate value storage (bf16 write->read overhead)
-        # 2. Mathematically equivalent to k*(1 + (a-1)*self.k_a)
-        #    but with better precision preservation
-        # 3. Particularly crucial for bf16 where intermediate values easily lose precision
-        # 4. Pytorch method: k = k.addcmul(k * (a - 1), self.k_a)
-        k = fused_k_rwkv7(k, a, self.k_a)
+            # Prefer addcmul over expanded form for numerical stability in bf16:
+            # 1. Fused Multiply-Add (FMA) in addcmul reduces intermediate rounding:
+            #    - Single op vs original 3 ops (mul, sub, mul)
+            #    - 1 less intermediate value storage (bf16 write->read overhead)
+            # 2. Mathematically equivalent to k*(1 + (a-1)*self.k_a)
+            #    but with better precision preservation
+            # 3. Particularly crucial for bf16 where intermediate values easily lose precision
+            # 4. Pytorch method: k = k.addcmul(k * (a - 1), self.k_a)
+            k = fused_k_rwkv7(k, a, self.k_a)
 
         # dealing with left-padding
         if attention_mask is not None:
@@ -310,8 +329,8 @@ class RWKV7Attention(nn.Module):
                 w=w,
                 k=k,
                 v=v,
-                a=-kk,
-                b=kk * a,
+                a=neg_kk if _TILELANG_E2E else -kk,
+                b=kka if _TILELANG_E2E else kk * a,
                 scale=1.,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
@@ -321,18 +340,32 @@ class RWKV7Attention(nn.Module):
                 chunk_size=64,
             )
         else:
-            o, recurrent_state = fused_mul_recurrent_rwkv7(
-                r=r,
-                w=w,
-                k=k,
-                v=v,
-                kk=kk,
-                a=a,
-                scale=1.,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-            )
+            if _TILELANG_E2E:
+                o, recurrent_state = fused_recurrent_rwkv7_e2e(
+                    r=r,
+                    w=w,
+                    k=k,
+                    v=v,
+                    a=neg_kk,
+                    b=kka,
+                    scale=1.,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                )
+            else:
+                o, recurrent_state = fused_mul_recurrent_rwkv7(
+                    r=r,
+                    w=w,
+                    k=k,
+                    v=v,
+                    kk=kk,
+                    a=a,
+                    scale=1.,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                )
 
         update_layer_cache(
             self,
@@ -342,12 +375,22 @@ class RWKV7Attention(nn.Module):
             offset=r.shape[1],
         )
 
-        if self.fuse_norm:
-            o = self.g_norm(rearrange(o, '... h d -> ... (h d)'))
+        if (
+            _TILELANG_E2E
+            and self.head_v_dim == self.head_dim
+            and self.g_norm.weight is not None
+            and self.g_norm.bias is not None
+        ):
+            # fused: GroupNorm + gate_output_correction in one kernel
+            o = gn_corr_rwkv7(o, r, k, self.r_k, v, g, self.g_norm.weight, self.g_norm.bias, self.g_norm.eps)
+            o = o.view(batch_size, seq_len, -1)
         else:
-            o = self.g_norm(rearrange(o, 'b t h d -> (b t) (h d)')).view(batch_size, seq_len, -1)
+            if self.fuse_norm:
+                o = self.g_norm(rearrange(o, '... h d -> ... (h d)'))
+            else:
+                o = self.g_norm(rearrange(o, 'b t h d -> (b t) (h d)')).view(batch_size, seq_len, -1)
 
-        o = gate_output_correction(o, r, k, self.r_k, v, g)
+            o = gate_output_correction(o, r, k, self.r_k, v, g)
         o = self.o_proj(o)
 
         return o, None, past_key_values, v_first

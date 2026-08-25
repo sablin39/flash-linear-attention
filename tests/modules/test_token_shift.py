@@ -147,7 +147,7 @@ def _packed_cu_seqlens(total_tokens: int, doc_len: int) -> torch.Tensor:
     return F.pad(lens.cumsum(0), (1, 0))
 
 
-def test_token_shift_varlen_uses_max_doc_len_for_short_kernel():
+def test_token_shift_varlen_many_docs():
     total_tokens, hidden_size = 262_144, 8
     torch.manual_seed(42)
 

@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 from packaging.version import Version
 
+from fla.ops.backends import dispatch
 from fla.utils import IS_AMD, IS_ARM, autotune_cache_kwargs, check_pytorch_version, input_guard
 
 logger = logging.getLogger(__name__)
@@ -269,6 +270,7 @@ class Rwkv7FusedAddcmul(torch.autograd.Function):
         return d_hiddn, d_xx, d_ixr, d_ixw, d_ixk, d_ixv, d_ixa, d_ixg
 
 
+@dispatch('rwkv7')
 def fused_addcmul_rwkv7(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,

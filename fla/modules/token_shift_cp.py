@@ -153,17 +153,13 @@ class TokenShiftCPFunction(torch.autograd.Function):
         ctx.pre_num_tokens = pre_num_tokens
 
         # Call original forward
-        y, N, T, use_short_kernel, cache_out = token_shift_fwd(
+        y, cache_out = token_shift_fwd(
             x=x,
             cu_seqlens=cu_seqlens,
             cache=cache,
             output_cache=True,
             chunk_indices=chunk_indices,
         )
-
-        ctx.N = N
-        ctx.T = T
-        ctx.use_short_kernel = use_short_kernel
 
         return y
 
@@ -179,11 +175,8 @@ class TokenShiftCPFunction(torch.autograd.Function):
         # Call original backward
         dx, grad_cache = token_shift_bwd(
             dy=dy,
-            N=ctx.N,
-            T=ctx.T,
             dcache=dcache,
             cu_seqlens=ctx.cu_seqlens,
-            use_short_kernel=ctx.use_short_kernel,
             has_init_cache=ctx.has_cache,
             chunk_indices=ctx.chunk_indices,
         )
