@@ -45,7 +45,7 @@ def _pointwise_config(D: int) -> dict[str, int]:
 
 
 @tilelang.jit(
-    out_idx=[8, 9, 10, 11, 12, 13],
+    out_idx=[8],
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
 def _addcmul_fwd_kernel(N_total, D, in_dtype, use_xg: bool, BT: int = 16, BD: int = 512, threads: int = 512):
@@ -59,12 +59,11 @@ def _addcmul_fwd_kernel(N_total, D, in_dtype, use_xg: bool, BT: int = 16, BD: in
         x_v: T.Tensor((D,), in_dtype),
         x_a: T.Tensor((D,), in_dtype),
         x_g: T.Tensor((D,), in_dtype),
-        oxr: T.Tensor((N_total, D), in_dtype),
-        oxw: T.Tensor((N_total, D), in_dtype),
-        oxk: T.Tensor((N_total, D), in_dtype),
-        oxv: T.Tensor((N_total, D), in_dtype),
-        oxa: T.Tensor((N_total, D), in_dtype),
-        oxg: T.Tensor((N_total, D), in_dtype),
+        # the 6 outputs share one buffer: a custom op returning a raw tuple can
+        # have that tuple passed across a torch.compile cudagraph partition
+        # boundary, where cudagraph trees only tracks flat outputs and raises
+        # "tensor(s) in the cudagraph pool not tracked as outputs"
+        o: T.Tensor((6, N_total, D), in_dtype),
     ):
         with T.Kernel(T.ceildiv(N_total, BT), T.ceildiv(D, BD), threads=threads) as (i_t, i_d):
             for kt, kd in T.Parallel(BT, BD):
@@ -73,18 +72,18 @@ def _addcmul_fwd_kernel(N_total, D, in_dtype, use_xg: bool, BT: int = 16, BD: in
                 if (t < N_total) and (d < D):
                     h = hidden[t, d]
                     de = delta[t, d]
-                    oxr[t, d] = h + de * x_r[d]
-                    oxw[t, d] = h + de * x_w[d]
-                    oxk[t, d] = h + de * x_k[d]
-                    oxv[t, d] = h + de * x_v[d]
-                    oxa[t, d] = h + de * x_a[d]
+                    o[0, t, d] = h + de * x_r[d]
+                    o[1, t, d] = h + de * x_w[d]
+                    o[2, t, d] = h + de * x_k[d]
+                    o[3, t, d] = h + de * x_v[d]
+                    o[4, t, d] = h + de * x_a[d]
                     if use_xg:
-                        oxg[t, d] = h + de * x_g[d]
+                        o[5, t, d] = h + de * x_g[d]
                     else:
-                        # x_g is a zeros placeholder here; copying it keeps oxg
+                        # x_g is a zeros placeholder here; copying it keeps o[5]
                         # zero-filled without a broadcast-constant store, which
                         # breaks fp16 codegen (cutlass::half_t -> half pack)
-                        oxg[t, d] = x_g[d]
+                        o[5, t, d] = x_g[d]
 
     return addcmul_fwd_tl
 
@@ -209,7 +208,7 @@ def _fused_addcmul_op(
     x_v: Tensor,
     x_a: Tensor,
     x_g: Tensor | None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> Tensor:
     B, T_, D = hidden.shape
     N_total = B * T_
     use_xg = x_g is not None
@@ -227,22 +226,15 @@ def _fused_addcmul_op(
         xg_flat = torch.zeros((D,), dtype=hidden.dtype, device=hidden.device)
 
     kernel = _addcmul_fwd_kernel(N_total, D, _dtype_str(hidden), use_xg, **_pointwise_config(D))
-    oxr, oxw, oxk, oxv, oxa, oxg = kernel(
+    o = kernel(
         hidden_flat, delta_flat, xr_flat, xw_flat, xk_flat, xv_flat, xa_flat, xg_flat,
     )
-    return (
-        oxr.view(B, T_, D),
-        oxw.view(B, T_, D),
-        oxk.view(B, T_, D),
-        oxv.view(B, T_, D),
-        oxa.view(B, T_, D),
-        oxg.view(B, T_, D),
-    )
+    return o.view(6, B, T_, D)
 
 
 @_fused_addcmul_op.register_fake
 def _fused_addcmul_fake(hidden, delta, x_r, x_w, x_k, x_v, x_a, x_g):
-    return tuple(hidden.new_empty(hidden.shape) for _ in range(6))
+    return hidden.new_empty((6,) + hidden.shape)
 
 
 def _fused_addcmul_setup_context(ctx, inputs, output):
@@ -250,10 +242,6 @@ def _fused_addcmul_setup_context(ctx, inputs, output):
     dummy = hidden.new_empty((0,))
     ctx.save_for_backward(hidden, delta, x_r, x_w, x_k, x_v, x_a, x_g if x_g is not None else dummy)
     ctx.use_xg = x_g is not None
-
-
-def _zero_like_if_none(t, ref):
-    return torch.zeros_like(ref) if t is None else t
 
 
 @torch.library.custom_op("fla::fused_addcmul_rwkv7_bwd", mutates_args=())
@@ -272,7 +260,7 @@ def _fused_addcmul_bwd_op(
     x_g: Tensor,
     delta: Tensor,
     use_xg: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> Tensor:
     B, T_, D = delta.shape
     N_total = B * T_
     S = max(1, min(64, N_total // 2048))
@@ -293,56 +281,41 @@ def _fused_addcmul_bwd_op(
         x_g.reshape(D).contiguous(),
         delta.reshape(N_total, D).contiguous(),
     )
-    # separate reductions: custom op outputs may not share storage
     d_x = [parts.select(0, i).sum(dim=0).to(delta.dtype) for i in range(6)]
-    return (
-        d_hidden.view_as(delta),
-        d_delta.view_as(delta),
-        d_x[0].view_as(x_r),
-        d_x[1].view_as(x_w),
-        d_x[2].view_as(x_k),
-        d_x[3].view_as(x_v),
-        d_x[4].view_as(x_a),
-        d_x[5].view_as(x_g),
-    )
+    # single flat output: a raw multi-output tuple crossing a torch.compile
+    # cudagraph partition boundary escapes cudagraph trees' flat output
+    # tracking ("tensor(s) in the cudagraph pool not tracked as outputs"), and
+    # tagging the op cudagraph_unsafe trips an inductor partition codegen bug
+    # at scale (phantom buffer names in the generated wrapper, torch 2.13)
+    return torch.cat((d_hidden.reshape(-1), d_delta.reshape(-1),
+                      *(d.reshape(-1) for d in d_x)))
 
 
 @_fused_addcmul_bwd_op.register_fake
 def _fused_addcmul_bwd_fake(dxr, dxw, dxk, dxv, dxa, dxg, x_r, x_w, x_k, x_v, x_a, x_g, delta, use_xg):
-    return (
-        torch.empty_like(delta),
-        torch.empty_like(delta),
-        torch.empty_like(x_r),
-        torch.empty_like(x_w),
-        torch.empty_like(x_k),
-        torch.empty_like(x_v),
-        torch.empty_like(x_a),
-        torch.empty_like(x_g),
-    )
+    return delta.new_empty(2 * delta.numel() + 6 * x_r.numel())
 
 
-def _fused_addcmul_backward(ctx, dxr, dxw, dxk, dxv, dxa, dxg):
+def _fused_addcmul_backward(ctx, d_o: torch.Tensor):
     hidden, delta, x_r, x_w, x_k, x_v, x_a, x_g_or_dummy = ctx.saved_tensors
     use_xg = ctx.use_xg
+    # dead slices (e.g. oxg when x_g is None) come back as zeros; the
+    # use_xg=False kernel never reads dxg anyway
+    dxr, dxw, dxk, dxv, dxa, dxg = d_o.unbind(0)
 
-    dxr = _zero_like_if_none(dxr, hidden)
-    dxw = _zero_like_if_none(dxw, hidden)
-    dxk = _zero_like_if_none(dxk, hidden)
-    dxv = _zero_like_if_none(dxv, hidden)
-    dxa = _zero_like_if_none(dxa, hidden)
-    if use_xg:
-        dxg = _zero_like_if_none(dxg, hidden)
-    else:
-        # placeholder; the use_xg=False kernel never reads it
-        dxg = delta
-
-    d_hidden, d_delta, d_xr, d_xw, d_xk, d_xv, d_xa, d_xg = _fused_addcmul_bwd_op(
+    packed = _fused_addcmul_bwd_op(
         dxr, dxw, dxk, dxv, dxa, dxg,
         x_r, x_w, x_k, x_v, x_a,
         # placeholder for the use_xg=False kernel, which never reads it
+        # (the saved dummy is 0-element and would fail the op's reshape)
         x_g_or_dummy if use_xg else x_r,
         delta,
         use_xg,
+    )
+    saved = (delta, delta, x_r, x_w, x_k, x_v, x_a, x_g_or_dummy if use_xg else x_r)
+    outs = torch.split(packed, [t.numel() for t in saved])
+    d_hidden, d_delta, d_xr, d_xw, d_xk, d_xv, d_xa, d_xg = (
+        s.view_as(t) for s, t in zip(outs, saved)
     )
     return (
         d_hidden.view_as(hidden),
@@ -367,5 +340,6 @@ def fused_addcmul_rwkv7_tilelang(
     xa: torch.Tensor,
     xg: torch.Tensor | None = None,
 ):
-    oxr, oxw, oxk, oxv, oxa, oxg = _fused_addcmul_op(hidden_states, delta, xr, xw, xk, xv, xa, xg)
+    o = _fused_addcmul_op(hidden_states, delta, xr, xw, xk, xv, xa, xg)
+    oxr, oxw, oxk, oxv, oxa, oxg = o.unbind(0)
     return oxr, oxw, oxk, oxv, oxa, oxg if xg is not None else None

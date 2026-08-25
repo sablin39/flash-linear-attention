@@ -137,7 +137,7 @@ def _fused_k_update_setup_context(ctx, inputs, output):
 
 
 @torch.library.custom_op("fla::fused_k_rwkv7_bwd", mutates_args=())
-def _fused_k_update_bwd_op(dy: Tensor, k: Tensor, a: Tensor, ka: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+def _fused_k_update_bwd_op(dy: Tensor, k: Tensor, a: Tensor, ka: Tensor) -> Tensor:
     D = k.shape[-1]
     N_total = k.numel() // D
     # Segment count: enough blocks to fill the GPU, but each block should
@@ -152,17 +152,24 @@ def _fused_k_update_bwd_op(dy: Tensor, k: Tensor, a: Tensor, ka: Tensor) -> tupl
     kernel = _k_update_bwd_kernel(N_total, S, D, _dtype_str(k))
     dk, da, dka_part = kernel(dy_flat, k_flat, a_flat, ka_flat)
     dka = dka_part.sum(dim=0).to(ka.dtype)
-    return dk.view_as(k), da.view_as(a), dka.view_as(ka)
+    # single flat output: a raw multi-output tuple crossing a torch.compile
+    # cudagraph partition boundary escapes cudagraph trees' flat output
+    # tracking ("tensor(s) in the cudagraph pool not tracked as outputs"), and
+    # tagging the op cudagraph_unsafe trips an inductor partition codegen bug
+    # at scale (phantom buffer names in the generated wrapper, torch 2.13)
+    return torch.cat((dk.reshape(-1), da.reshape(-1), dka.reshape(-1)))
 
 
 @_fused_k_update_bwd_op.register_fake
 def _fused_k_update_bwd_fake(dy, k, a, ka):
-    return torch.empty_like(k), torch.empty_like(a), torch.empty_like(ka)
+    return k.new_empty(k.numel() + a.numel() + ka.numel())
 
 
 def _fused_k_update_backward(ctx, dy: torch.Tensor):
     k, a, ka = ctx.saved_tensors
-    return _fused_k_update_bwd_op(dy, k, a, ka)
+    packed = _fused_k_update_bwd_op(dy, k, a, ka)
+    outs = torch.split(packed, [t.numel() for t in (k, a, ka)])
+    return tuple(s.view_as(t) for s, t in zip(outs, (k, a, ka)))
 
 
 _fused_k_update_op.register_autograd(
