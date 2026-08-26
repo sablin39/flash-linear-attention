@@ -15,12 +15,15 @@ fla.layers.rwkv7 / fla.models.rwkv7.modeling_rwkv7 to the TileLang custom ops
 directly, which are opaque (and therefore fullgraph-safe) to dynamo in both
 forward and backward.
 
-Scope: the whole RWKV7Attention forward. The chunk path rebases onto fused
-kernels (kk_pre_rwkv7 folds the k-update + kk normalization + DPLR a/b
-materialization into one op; gn_corr_rwkv7 folds GroupNorm + gate output
-correction), so both fuse_norm modes share one compile-safe route. The T==1
-decode branch is served by the inference-only fused_recurrent_rwkv7_e2e custom
-op, which is cudagraph-capture-safe.
+Scope: the whole RWKV7Attention forward plus, for fuse_norm=True models, the
+block-level LayerNorms (pre/attn/ffn/final norms, rebound to
+TileLangLayerNorm, which covers the plain and prenorm fused-residual forms;
+the attention-output GroupNorm is already folded into gn_corr_rwkv7). The
+chunk path rebases onto fused kernels (kk_pre_rwkv7 folds the k-update + kk
+normalization + DPLR a/b materialization into one op; gn_corr_rwkv7 folds
+GroupNorm + gate output correction), so both fuse_norm modes share one
+compile-safe route. The T==1 decode branch is served by the inference-only
+fused_recurrent_rwkv7_e2e custom op, which is cudagraph-capture-safe.
 
 cudagraph decode (mode="reduce-overhead") contract: the conv/recurrent state
 buffers are updated in place via static-address tensors, so a serving loop
@@ -125,6 +128,9 @@ def patch_e2e_namespace(ns: dict) -> None:
     from fla.ops.rwkv7.backends.tilelang.kk_pre import (
         kk_pre_rwkv7,
     )
+    from fla.ops.rwkv7.backends.tilelang.layernorm import (
+        TileLangLayerNorm,
+    )
     from fla.ops.rwkv7.backends.tilelang.token_shift import (
         token_shift_tilelang,
     )
@@ -149,6 +155,10 @@ def patch_e2e_namespace(ns: dict) -> None:
         "fused_k_rwkv7": fused_k_rwkv7_tilelang,
         "gate_output_correction": gate_output_correction_tilelang,
         "chunk_rwkv7": chunk_rwkv7_tilelang,
+        # fuse_norm=True block norms (pre/attn/ffn/final) — keeps the whole
+        # block inside the compiled graph instead of graph-breaking on the
+        # dispatch wrapper's compiler.disable
+        "LayerNorm": TileLangLayerNorm,
     }
     for name, fn in mapping.items():
         if name in ns:
