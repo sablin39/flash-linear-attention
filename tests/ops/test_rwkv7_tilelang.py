@@ -550,6 +550,64 @@ def test_gn_corr_tilelang_parity(B: int, T: int, H: int, D: int, dtype: torch.dt
 
 @requires_tilelang_route
 @pytest.mark.parametrize(
+    ('B', 'T', 'D', 'dtype', 'prenorm'),
+    [
+        (2, 256, 2048, torch.bfloat16, False),
+        (2, 256, 2048, torch.bfloat16, True),
+        (2, 256, 2048, torch.float16, True),
+        (8, 1, 2048, torch.bfloat16, False),   # decode shape
+        (1, 517, 1024, torch.bfloat16, True),  # N not a multiple of BT
+    ],
+)
+def test_layernorm_tilelang_parity(B: int, T: int, D: int, dtype: torch.dtype, prenorm: bool):
+    from fla.modules.layernorm import layer_norm as fla_layer_norm
+    from fla.ops.rwkv7.backends.tilelang.layernorm import (
+        _layer_norm_op,
+        _layer_norm_prenorm_op,
+    )
+
+    torch.manual_seed(42)
+    eps = 1e-5
+    x = torch.randn(B, T, D, device=device, dtype=dtype)
+    res = torch.randn(B, T, D, device=device, dtype=dtype)
+    weight = torch.randn(D, device=device, dtype=dtype) * 0.2 + 1.0
+    bias = torch.randn(D, device=device, dtype=dtype) * 0.1
+    dy = torch.randn(B, T, D, device=device, dtype=dtype)
+    dres = torch.randn(B, T, D, device=device, dtype=dtype)
+
+    def run(fn):
+        x_ = x.clone().requires_grad_()
+        res_ = res.clone().requires_grad_()
+        w_ = weight.clone().requires_grad_()
+        b_ = bias.clone().requires_grad_()
+        if prenorm:
+            y, s = fn(x_, res_, w_, b_)
+            grads = torch.autograd.grad([y, s], [x_, res_, w_, b_], [dy, dres])
+            return [y, s, *grads]
+        y = fn(x_, None, w_, b_)
+        grads = torch.autograd.grad(y, [x_, w_, b_], dy)
+        return [y, *grads]
+
+    def fla_fn(x_, res_, w_, b_):
+        if res_ is not None:
+            return fla_layer_norm(x_, w_, b_, residual=res_, eps=eps, prenorm=True)
+        return fla_layer_norm(x_, w_, b_, eps=eps)
+
+    def tl_fn(x_, res_, w_, b_):
+        if res_ is not None:
+            return _layer_norm_prenorm_op(x_, res_, w_, b_, eps)
+        return _layer_norm_op(x_, w_, b_, eps)
+
+    ref = run(fla_fn)
+    out = run(tl_fn)
+    names = (['y', 'res', 'dx', 'dres', 'dw', 'db'] if prenorm else ['y', 'dx', 'dw', 'db'])
+    ratio = 0.005 if dtype == torch.bfloat16 else 0.002
+    for name, r, t in zip(names, ref, out):
+        assert_close(name, r, t, ratio)
+
+
+@requires_tilelang_route
+@pytest.mark.parametrize(
     ('B', 'T', 'H', 'D', 'dtype', 'use_state'),
     [
         (1, 1, 32, 64, torch.bfloat16, True),    # decode
