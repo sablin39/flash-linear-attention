@@ -9,13 +9,16 @@
 
 Two stages:
 1. `_prepare_wy_repr_fwd_kernel`: invert the strictly lower-triangular A_ab
-   in-place per chunk via the iterative formula M_{k+1} = M_k + e_i (e_i^T M_k)
-   for i = 1..BT-1, then add identity. Yields fp32 A_ab_inv, matching FLA's
+   per chunk with the exact tensor-core scheme (FLA #1162): each 16x16
+   diagonal block is inverted as (I+L)(I+L^2)(I+L^4)(I+L^8) = (I-L)^-1
+   (exact since L^16 = 0), off-diagonal blocks follow by block forward
+   substitution, and every GEMM round is rounded back to fp16, matching
+   FLA's Triton safe-gate path. Yields fp32 A_ab_inv, matching FLA's
    public dtype boundary.
 2. `_wu_fwd_kernel`: compute `b_Aak = A_ab_inv @ A_ak` (causal masks applied),
    then `w = A_ab_inv @ ag` and `u = b_Aak @ v`.
 
-Adapted from FLA's prepare_wy_repr_fwd_kernel_chunk32 + wu_fwd_kernel.
+Adapted from FLA's prepare_wy_repr_fwd_kernel_safe + wu_fwd_kernel.
 """
 
 import tilelang
@@ -50,6 +53,8 @@ def _wu_fwd_config(BT: int, K: int, device: torch.device) -> dict[str, int]:
 )
 def _prepare_wy_repr_fwd_kernel(H, BT, in_dtype, threads: int = 32):
     acc_dtype = "float32"
+    NB = 16
+    NS = BT // NB
     n_tokens, n_seq_plus_one, n_chunks = T.dynamic(
         "n_tokens, n_seq_plus_one, n_chunks"
     )
@@ -73,162 +78,271 @@ def _prepare_wy_repr_fwd_kernel(H, BT, in_dtype, threads: int = 32):
             bos = T.if_then_else(is_valid_chunk, bos_raw, T.int32(0))
             eos = T.if_then_else(is_valid_chunk, eos_raw, T.int32(0))
 
-            M = T.alloc_shared((BT, BT), acc_dtype)
-            v = T.alloc_shared((BT,), acc_dtype)
-            v_new = T.alloc_fragment((BT,), acc_dtype)
-            T.clear(v_new)
+            # L tiles hold the strictly lower part of A_ab per 16x16 block
+            # (off-diagonal blocks are full); T tiles hold the inverse blocks.
+            L00 = T.alloc_shared((NB, NB), "float16")
+            T00 = T.alloc_shared((NB, NB), "float16")
+            I_L = T.alloc_shared((NB, NB), "float16")
+            L2 = T.alloc_shared((NB, NB), "float16")
+            L4 = T.alloc_shared((NB, NB), "float16")
+            L8 = T.alloc_shared((NB, NB), "float16")
+            I_L2 = T.alloc_shared((NB, NB), "float16")
+            I_L4 = T.alloc_shared((NB, NB), "float16")
+            I_L8 = T.alloc_shared((NB, NB), "float16")
+            P = T.alloc_shared((NB, NB), "float16")
+            fA = T.alloc_fragment((NB, NB), acc_dtype)
+            if NS >= 2:
+                L10 = T.alloc_shared((NB, NB), "float16")
+                L11 = T.alloc_shared((NB, NB), "float16")
+                T10 = T.alloc_shared((NB, NB), "float16")
+                T11 = T.alloc_shared((NB, NB), "float16")
+            if NS == 4:
+                L20 = T.alloc_shared((NB, NB), "float16")
+                L21 = T.alloc_shared((NB, NB), "float16")
+                L22 = T.alloc_shared((NB, NB), "float16")
+                L30 = T.alloc_shared((NB, NB), "float16")
+                L31 = T.alloc_shared((NB, NB), "float16")
+                L32 = T.alloc_shared((NB, NB), "float16")
+                L33 = T.alloc_shared((NB, NB), "float16")
+                T20 = T.alloc_shared((NB, NB), "float16")
+                T21 = T.alloc_shared((NB, NB), "float16")
+                T22 = T.alloc_shared((NB, NB), "float16")
+                T30 = T.alloc_shared((NB, NB), "float16")
+                T31 = T.alloc_shared((NB, NB), "float16")
+                T32 = T.alloc_shared((NB, NB), "float16")
+                T33 = T.alloc_shared((NB, NB), "float16")
+                Q = T.alloc_shared((NB, NB), "float16")
 
-            # Load A_ab, mask to strict lower triangular. Interior chunks
-            # bulk-copy and mask in shared; boundary chunks stay scalar.
-            if is_valid_chunk and (bos + BT <= eos):
-                T.copy(A_ab[bos: bos + BT, i_h, 0:BT], M)
-                for r, c in T.Parallel(BT, BT):
-                    if r <= c:
-                        M[r, c] = 0.0
-            else:
-                for r, c in T.Parallel(BT, BT):
-                    t = bos + r
-                    if (r > c) and (t < eos):
-                        M[r, c] = A_ab[t, i_h, c]
+            # Load the strict-lower blocks; rows past eos stay zero, so
+            # partial chunks invert to identity there (stores are masked).
+            for r, c in T.Parallel(NB, NB):
+                t0 = bos + r
+                if (r > c) and (t0 < eos):
+                    L00[r, c] = A_ab[t0, i_h, c]
+                else:
+                    L00[r, c] = T.Cast("float16", 0.0)
+                if NS >= 2:
+                    t1 = bos + NB + r
+                    if t1 < eos:
+                        L10[r, c] = A_ab[t1, i_h, c]
+                        if r > c:
+                            L11[r, c] = A_ab[t1, i_h, NB + c]
+                        else:
+                            L11[r, c] = T.Cast("float16", 0.0)
                     else:
-                        M[r, c] = 0.0
+                        L10[r, c] = T.Cast("float16", 0.0)
+                        L11[r, c] = T.Cast("float16", 0.0)
+                if NS == 4:
+                    t2 = bos + 2 * NB + r
+                    if t2 < eos:
+                        L20[r, c] = A_ab[t2, i_h, c]
+                        L21[r, c] = A_ab[t2, i_h, NB + c]
+                        if r > c:
+                            L22[r, c] = A_ab[t2, i_h, 2 * NB + c]
+                        else:
+                            L22[r, c] = T.Cast("float16", 0.0)
+                    else:
+                        L20[r, c] = T.Cast("float16", 0.0)
+                        L21[r, c] = T.Cast("float16", 0.0)
+                        L22[r, c] = T.Cast("float16", 0.0)
+                    t3 = bos + 3 * NB + r
+                    if t3 < eos:
+                        L30[r, c] = A_ab[t3, i_h, c]
+                        L31[r, c] = A_ab[t3, i_h, NB + c]
+                        L32[r, c] = A_ab[t3, i_h, 2 * NB + c]
+                        if r > c:
+                            L33[r, c] = A_ab[t3, i_h, 3 * NB + c]
+                        else:
+                            L33[r, c] = T.Cast("float16", 0.0)
+                    else:
+                        L30[r, c] = T.Cast("float16", 0.0)
+                        L31[r, c] = T.Cast("float16", 0.0)
+                        L32[r, c] = T.Cast("float16", 0.0)
+                        L33[r, c] = T.Cast("float16", 0.0)
 
-            # Iterative inversion: for i in 1..BT-1. The j-reduction runs
-            # serially so each c-lane accumulator stays private to one thread;
-            # the trip count stops at row_i since v[j>=row_i] is zero.
-            for i in T.serial(BT - 1):
-                row_i = i + 1
-                for c in T.Parallel(BT):
-                    v[c] = M[row_i, c]
+            # Diagonal blocks: (I-L)^-1 = (I+L)(I+L^2)(I+L^4)(I+L^8), exact
+            # because L is strictly lower triangular (L^16 = 0). Every GEMM
+            # round is rounded back to fp16, matching FLA's Triton safe path.
+            T.gemm(L00, L00, fA, clear_accum=True)
+            for r, c in T.Parallel(NB, NB):
+                L2[r, c] = T.Cast("float16", fA[r, c])
+            T.gemm(L2, L2, fA, clear_accum=True)
+            for r, c in T.Parallel(NB, NB):
+                L4[r, c] = T.Cast("float16", fA[r, c])
+            T.gemm(L4, L4, fA, clear_accum=True)
+            for r, c in T.Parallel(NB, NB):
+                L8[r, c] = T.Cast("float16", fA[r, c])
+            for r, c in T.Parallel(NB, NB):
+                I_L[r, c] = L00[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                I_L2[r, c] = L2[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                I_L4[r, c] = L4[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                I_L8[r, c] = L8[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+            T.gemm(I_L, I_L2, fA, clear_accum=True)
+            for r, c in T.Parallel(NB, NB):
+                P[r, c] = T.Cast("float16", fA[r, c])
+            T.gemm(P, I_L4, fA, clear_accum=True)
+            for r, c in T.Parallel(NB, NB):
+                P[r, c] = T.Cast("float16", fA[r, c])
+            T.gemm(P, I_L8, fA, clear_accum=True)
+            for r, c in T.Parallel(NB, NB):
+                T00[r, c] = T.Cast("float16", fA[r, c])
+            if NS >= 2:
+                T.gemm(L11, L11, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L2[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L2, L2, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L4[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L4, L4, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L8[r, c] = T.Cast("float16", fA[r, c])
+                for r, c in T.Parallel(NB, NB):
+                    I_L[r, c] = L11[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L2[r, c] = L2[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L4[r, c] = L4[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L8[r, c] = L8[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                T.gemm(I_L, I_L2, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(P, I_L4, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(P, I_L8, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    T11[r, c] = T.Cast("float16", fA[r, c])
+                # T10 = T11 @ (L10 @ T00)
+                T.gemm(L10, T00, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(T11, P, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    T10[r, c] = T.Cast("float16", fA[r, c])
+            if NS == 4:
+                T.gemm(L22, L22, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L2[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L2, L2, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L4[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L4, L4, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L8[r, c] = T.Cast("float16", fA[r, c])
+                for r, c in T.Parallel(NB, NB):
+                    I_L[r, c] = L22[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L2[r, c] = L2[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L4[r, c] = L4[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L8[r, c] = L8[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                T.gemm(I_L, I_L2, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(P, I_L4, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(P, I_L8, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    T22[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L33, L33, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L2[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L2, L2, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L4[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L4, L4, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    L8[r, c] = T.Cast("float16", fA[r, c])
+                for r, c in T.Parallel(NB, NB):
+                    I_L[r, c] = L33[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L2[r, c] = L2[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L4[r, c] = L4[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                    I_L8[r, c] = L8[r, c] + T.if_then_else(r == c, T.Cast("float16", 1.0), T.Cast("float16", 0.0))
+                T.gemm(I_L, I_L2, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(P, I_L4, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(P, I_L8, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    T33[r, c] = T.Cast("float16", fA[r, c])
+                # Block forward substitution for the off-diagonal blocks
+                # (FLA #1162 formulas).
+                # T21 = T22 @ (L21 @ T11)
+                T.gemm(L21, T11, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(T22, P, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    T21[r, c] = T.Cast("float16", fA[r, c])
+                # T32 = T33 @ (L32 @ T22)
+                T.gemm(L32, T22, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(T33, P, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    T32[r, c] = T.Cast("float16", fA[r, c])
+                # P1 = L20 @ T00 + L21 @ T10; P2 = L30 @ T00 + L31 @ T10
+                T.gemm(L20, T00, fA, clear_accum=True)
+                T.gemm(L21, T10, fA)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L30, T00, fA, clear_accum=True)
+                T.gemm(L31, T10, fA)
+                for r, c in T.Parallel(NB, NB):
+                    Q[r, c] = T.Cast("float16", fA[r, c])
+                # T20 = T22 @ P1
+                T.gemm(T22, P, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    T20[r, c] = T.Cast("float16", fA[r, c])
+                # T30 = T32 @ P1 + T33 @ P2
+                T.gemm(T32, P, fA, clear_accum=True)
+                T.gemm(T33, Q, fA)
+                for r, c in T.Parallel(NB, NB):
+                    T30[r, c] = T.Cast("float16", fA[r, c])
+                # T31 = T32 @ (L21 @ T11) + T33 @ (L31 @ T11)
+                T.gemm(L21, T11, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    P[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(L31, T11, fA, clear_accum=True)
+                for r, c in T.Parallel(NB, NB):
+                    Q[r, c] = T.Cast("float16", fA[r, c])
+                T.gemm(T32, P, fA, clear_accum=True)
+                T.gemm(T33, Q, fA)
+                for r, c in T.Parallel(NB, NB):
+                    T31[r, c] = T.Cast("float16", fA[r, c])
 
-                for j in T.serial(1, row_i):
-                    for c in T.Parallel(BT):
-                        if c < j:
-                            v_new[c] = v_new[c] + v[j] * M[j, c]
-
-                for c in T.Parallel(BT):
-                    if c < row_i:
-                        M[row_i, c] = v[c] + v_new[c]
-                    v_new[c] = 0.0
-
-            # Add identity to diagonal
-            for r, c in T.Parallel(BT, BT):
-                if r == c:
-                    M[r, c] = M[r, c] + 1.0
-
-            # Store
-            for r, c in T.Parallel(BT, BT):
-                t = bos + r
-                if t < eos:
-                    A_ab_inv[t, i_h, c] = M[r, c]
+            # Store inverse blocks; upper off-diagonal blocks are exact zeros.
+            for r, c in T.Parallel(NB, NB):
+                t0 = bos + r
+                if t0 < eos:
+                    A_ab_inv[t0, i_h, c] = T.Cast(acc_dtype, T00[r, c])
+                    if NS >= 2:
+                        A_ab_inv[t0, i_h, NB + c] = 0.0
+                    if NS == 4:
+                        A_ab_inv[t0, i_h, 2 * NB + c] = 0.0
+                        A_ab_inv[t0, i_h, 3 * NB + c] = 0.0
+                if NS >= 2:
+                    t1 = bos + NB + r
+                    if t1 < eos:
+                        A_ab_inv[t1, i_h, c] = T.Cast(acc_dtype, T10[r, c])
+                        A_ab_inv[t1, i_h, NB + c] = T.Cast(acc_dtype, T11[r, c])
+                        if NS == 4:
+                            A_ab_inv[t1, i_h, 2 * NB + c] = 0.0
+                            A_ab_inv[t1, i_h, 3 * NB + c] = 0.0
+                if NS == 4:
+                    t2 = bos + 2 * NB + r
+                    if t2 < eos:
+                        A_ab_inv[t2, i_h, c] = T.Cast(acc_dtype, T20[r, c])
+                        A_ab_inv[t2, i_h, NB + c] = T.Cast(acc_dtype, T21[r, c])
+                        A_ab_inv[t2, i_h, 2 * NB + c] = T.Cast(acc_dtype, T22[r, c])
+                        A_ab_inv[t2, i_h, 3 * NB + c] = 0.0
+                    t3 = bos + 3 * NB + r
+                    if t3 < eos:
+                        A_ab_inv[t3, i_h, c] = T.Cast(acc_dtype, T30[r, c])
+                        A_ab_inv[t3, i_h, NB + c] = T.Cast(acc_dtype, T31[r, c])
+                        A_ab_inv[t3, i_h, 2 * NB + c] = T.Cast(acc_dtype, T32[r, c])
+                        A_ab_inv[t3, i_h, 3 * NB + c] = T.Cast(acc_dtype, T33[r, c])
 
     return prepare_wy_repr_fwd_tl
-
-
-@tilelang.jit(
-    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-                  tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: False,
-                  },
-)
-def _prepare_wy_repr_fwd_kernel_bt64(H, in_dtype, threads: int = 32):
-    acc_dtype = "float32"
-    BT = 64
-    BC = 32
-    n_tokens, n_seq_plus_one, n_chunks = T.dynamic(
-        "n_tokens, n_seq_plus_one, n_chunks"
-    )
-
-    @T.prim_func
-    def prepare_wy_repr_fwd_bt64_tl(
-        A_ab: T.Tensor((n_tokens, H, BT), "float16"),
-        cu_seqlens: T.Tensor((n_seq_plus_one,), "int32"),
-        chunk_indices: T.Tensor((n_chunks, 2), "int32"),
-        A_ab_inv: T.Tensor((n_tokens, H, BT), acc_dtype),
-    ):
-        with T.Kernel(n_chunks, H, threads=threads) as (i_c, i_h):
-            i_n = chunk_indices[i_c, 0]
-            i_t = chunk_indices[i_c, 1]
-            safe_i_n = T.max(i_n, 0)
-            seq_bos = cu_seqlens[safe_i_n]
-            seq_eos = cu_seqlens[safe_i_n + 1]
-            bos_raw = seq_bos + i_t * BT
-            eos_raw = T.min(bos_raw + BT, seq_eos)
-            is_valid_chunk = i_n >= 0
-            bos = T.if_then_else(is_valid_chunk, bos_raw, T.int32(0))
-            eos = T.if_then_else(is_valid_chunk, eos_raw, T.int32(0))
-
-            A1 = T.alloc_shared((BC, BC), acc_dtype)
-            A2 = T.alloc_shared((BC, BC), acc_dtype)
-            A3 = T.alloc_shared((BC, BC), acc_dtype)
-            tmp = T.alloc_fragment((BC, BC), acc_dtype)
-            tmp_shared = T.alloc_shared((BC, BC), acc_dtype)
-            A3_out = T.alloc_fragment((BC, BC), acc_dtype)
-            v = T.alloc_shared((BC,), acc_dtype)
-            v2 = T.alloc_shared((BC,), acc_dtype)
-            v_new = T.alloc_fragment((BC,), acc_dtype)
-            v_new2 = T.alloc_fragment((BC,), acc_dtype)
-            T.clear(v_new)
-            T.clear(v_new2)
-
-            # FLA's chunk64 path inverts the two 32x32 diagonal blocks
-            # independently, then forms the bottom-left block with two GEMMs.
-            # The two inversions share one loop so the independent FMA chains
-            # interleave (same per-matrix accumulation order); only j < row_i
-            # can contribute since v[j>=row_i] is exactly zero above the
-            # strict lower triangle.
-            for r, c in T.Parallel(BC, BC):
-                t1 = bos + r
-                t2 = bos + BC + r
-                if (r > c) and (t1 < eos):
-                    A1[r, c] = A_ab[t1, i_h, c]
-                else:
-                    A1[r, c] = 0.0
-                if (r > c) and (t2 < eos):
-                    A2[r, c] = A_ab[t2, i_h, BC + c]
-                else:
-                    A2[r, c] = 0.0
-                if t2 < eos:
-                    A3[r, c] = A_ab[t2, i_h, c]
-                else:
-                    A3[r, c] = 0.0
-
-            for i in T.serial(BC - 1):
-                row_i = i + 1
-                for c in T.Parallel(BC):
-                    v[c] = A1[row_i, c]
-                    v2[c] = A2[row_i, c]
-                for j in T.serial(1, row_i):
-                    for c in T.Parallel(BC):
-                        if c < j:
-                            v_new[c] = v_new[c] + v[j] * A1[j, c]
-                            v_new2[c] = v_new2[c] + v2[j] * A2[j, c]
-                for c in T.Parallel(BC):
-                    if c < row_i:
-                        A1[row_i, c] = v[c] + v_new[c]
-                        A2[row_i, c] = v2[c] + v_new2[c]
-                    v_new[c] = 0.0
-                    v_new2[c] = 0.0
-
-            for r, c in T.Parallel(BC, BC):
-                if r == c:
-                    A1[r, c] = A1[r, c] + 1.0
-                    A2[r, c] = A2[r, c] + 1.0
-
-            T.gemm(A2, A3, tmp, clear_accum=True)
-            T.copy(tmp, tmp_shared)
-            T.gemm(tmp_shared, A1, A3_out, clear_accum=True)
-
-            for r, c in T.Parallel(BC, BC):
-                t1 = bos + r
-                t2 = bos + BC + r
-                if t1 < eos:
-                    A_ab_inv[t1, i_h, c] = A1[r, c]
-                    A_ab_inv[t1, i_h, BC + c] = 0.0
-                if t2 < eos:
-                    A_ab_inv[t2, i_h, c] = A3_out[r, c]
-                    A_ab_inv[t2, i_h, BC + c] = A2[r, c]
-
-    return prepare_wy_repr_fwd_bt64_tl
 
 
 @tilelang.jit(
@@ -377,10 +491,7 @@ def prepare_wy_repr_fwd(
     A_ab_f = A_ab.reshape(N_tokens, H, BT).contiguous()
     A_ak_f = A_ak.reshape(N_tokens, H, BT).contiguous()
 
-    if BT == 64:
-        inv_kernel = _prepare_wy_repr_fwd_kernel_bt64(H, in_dtype, threads=32)
-    else:
-        inv_kernel = _prepare_wy_repr_fwd_kernel(H, BT, in_dtype, threads=32)
+    inv_kernel = _prepare_wy_repr_fwd_kernel(H, BT, in_dtype)
     A_ab_inv_f = torch.empty((N_tokens, H, BT), dtype=torch.float32, device=ag.device)
     inv_kernel(A_ab_f, layout.cu_seqlens, layout.chunk_indices, A_ab_inv_f)
 
