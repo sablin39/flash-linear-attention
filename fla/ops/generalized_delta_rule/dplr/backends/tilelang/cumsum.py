@@ -28,11 +28,41 @@ measured 2.2x behind Triton on sm_90.
 Varlen batches keep the irregular-boundary kernel keyed by chunk_indices.
 """
 
+import logging
+
 import tilelang
 import tilelang.language as T
 import torch
 
 from .layout import ChunkLayout, build_varlen_chunk_layout
+
+logger = logging.getLogger(__name__)
+
+# Rect configs whose TileLang kernel failed to compile in this process, so
+# later calls go straight to the torch chain instead of recompiling.
+_RECT_KERNEL_REJECTED: set[tuple] = set()
+
+
+def _torch_rect_cumsum(
+    g: torch.Tensor,
+    chunk_size: int,
+    scale_f: float,
+    output_ge: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Vectorized PyTorch fp32 within-chunk cumsum (pre-kernel formulation)."""
+    B, T_, H, K = g.shape
+    BT = chunk_size
+    NT = -(-T_ // BT)
+    x = g.float()
+    if NT * BT != T_:
+        x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, NT * BT - T_))
+    x = x.view(B, NT, BT, H, K)
+    gi = x.cumsum(dim=2)
+    ge = gi - x if output_ge else None
+    gi = (gi * scale_f).view(B, NT * BT, H, K)[:, :T_]
+    if output_ge:
+        ge = (ge * scale_f).view(B, NT * BT, H, K)[:, :T_]
+    return gi.contiguous(), ge.contiguous() if output_ge else None
 
 # ---------------------------------------------------------------------------
 # TileLang segmented scan kernel for rectangular batches.
@@ -186,13 +216,26 @@ def chunk_local_cumsum(
 
     if not is_varlen:
         B, T_, H, K = g.shape
-        kernel = _chunk_local_cumsum_rect_kernel_tl(
-            H, K, chunk_size, 64, in_dtype, scale_f, output_ge
-        )
-        gi = torch.empty((B, T_, H, K), dtype=torch.float32, device=g.device)
-        ge = torch.empty((B, T_, H, K), dtype=torch.float32, device=g.device) if output_ge else gi
-        kernel(g.contiguous(), gi, ge)
-        return gi, ge if output_ge else None
+        key = (H, K, chunk_size, in_dtype, scale_f, output_ge)
+        if key not in _RECT_KERNEL_REJECTED:
+            try:
+                kernel = _chunk_local_cumsum_rect_kernel_tl(
+                    H, K, chunk_size, 64, in_dtype, scale_f, output_ge
+                )
+                gi = torch.empty((B, T_, H, K), dtype=torch.float32, device=g.device)
+                ge = torch.empty((B, T_, H, K), dtype=torch.float32, device=g.device) if output_ge else gi
+                kernel(g.contiguous(), gi, ge)
+                return gi, ge if output_ge else None
+            except Exception as e:
+                # tilelang#3291 (exact z3 thread bounds in thread_storage_sync)
+                # rejects this kernel's compile at K=64 with BT 16/32; keep the
+                # route alive on the torch chain until the pass accepts it again.
+                _RECT_KERNEL_REJECTED.add(key)
+                logger.warning(
+                    f"[TileLang DPLR] rect cumsum kernel rejected at compile ({type(e).__name__}); "
+                    f"falling back to the torch chain for {key}"
+                )
+        return _torch_rect_cumsum(g, chunk_size, scale_f, output_ge)
 
     # Varlen path: the chunk_indices-keyed kernel handles irregular boundaries.
     B, T_, H, K = g.shape
