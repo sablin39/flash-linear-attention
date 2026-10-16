@@ -51,14 +51,17 @@ def _chunk_h_smem_bytes(BT: int, K: int, BV: int, in_dtype: str, pipelined: bool
     operand tile, the fp32 (BT, K) bg tile, and the fp32 (K,) last-gate row.
     Operand tiles (kg/w (BT, K), v/u (BT, BV)) are double-buffered when
     pipelined; the unpipelined variant instead carries the two fp32 (K, BV)
-    b_hc staging tiles, which the pipelined variant removes by accumulating
-    both outer-product GEMMs straight into b_hc.
+    b_hc staging tiles, of which the pipelined variant drops the kg one by
+    keeping that product in a fragment (the bg one stays: writing a single
+    fragment from both the bf16 and fp32 GEMMs fails sm90 layout inference).
     """
     elem = dtype_nbytes(in_dtype)
     base = elem * K * BV + 4 * (BT * BV + BT * K + K)
     n_bufs = 2 if pipelined else 1
     base += n_bufs * elem * (2 * BT * K + 2 * BT * BV)
-    if not pipelined:
+    if pipelined:
+        base += 4 * K * BV
+    else:
         base += 4 * 2 * K * BV
     return base
 
@@ -122,6 +125,14 @@ def _chunk_dplr_fwd_h_kernel(
                 w_shared = T.alloc_shared((n_bufs, BC, K), in_dtype)
                 v_shared = T.alloc_shared((n_bufs, BC, BV), in_dtype)
                 u_shared = T.alloc_shared((n_bufs, BC, BV), in_dtype)
+                # The cc90-proven split from the fused h+o kernel: the kg
+                # product may stay a fragment, but the fp32 bg product must
+                # stage through shared memory - writing one fragment from
+                # both the bf16 and fp32 GEMMs infers conflicting
+                # accumulator layouts on sm90 and fails lowering there.
+                b_hc_kg = T.alloc_fragment((K, BV), acc_dtype)
+                b_hc_bg = T.alloc_fragment((K, BV), acc_dtype)
+                b_hc_bg_shared = T.alloc_shared((K, BV), acc_dtype)
             else:
                 b_hc_kg = T.alloc_fragment((K, BV), acc_dtype)
                 b_hc_bg = T.alloc_fragment((K, BV), acc_dtype)
@@ -180,8 +191,6 @@ def _chunk_dplr_fwd_h_kernel(
                         if g_v < V:
                             h[boh + i_t, i_h, k_idx, g_v] = b_h_shared[k_idx, vv]
 
-                    T.clear(b_hc)
-
                     # The idle buffer's previous readers must finish before
                     # the cp.async below overwrites it.
                     T.sync_threads()
@@ -238,21 +247,26 @@ def _chunk_dplr_fwd_h_kernel(
                         if (t < eos) and (g_v < V):
                             v_new[t, i_h, g_v] = T.Cast(in_dtype, v2_frag[c, vv])
 
-                    # b_hc += kg^T @ v + bg^T @ v2, accumulated straight into
-                    # b_hc (fp32) instead of the unpipelined path's staged
-                    # per-product tiles; same fp32 add set, different order.
+                    # b_hc = kg^T @ v + bg^T @ v2.  Same two rounded adds
+                    # as the unpipelined path at BC == BT (bit-identical),
+                    # but only the bg product pays the smem round-trip.
                     T.gemm(
                         kg_shared[cur, :, :],
                         v_shared[cur, :, :],
-                        b_hc,
+                        b_hc_kg,
                         transpose_A=True,
+                        clear_accum=True,
                     )
                     T.gemm(
                         bg_shared,
                         v2_shared,
-                        b_hc,
+                        b_hc_bg,
                         transpose_A=True,
+                        clear_accum=True,
                     )
+                    T.copy(b_hc_bg, b_hc_bg_shared)
+                    for k_idx, vv in T.Parallel(K, BV):
+                        b_hc[k_idx, vv] = T.ieee_add(b_hc_kg[k_idx, vv], b_hc_bg_shared[k_idx, vv])
 
                     # Apply decay and accumulate. Clamp last_idx to <= eos-1.
                     last_idx = T.min(chunk_bos + BT - 1, eos - 1)
@@ -424,10 +438,9 @@ def chunk_dplr_fwd_h(
     config = _chunk_h_fwd_config(K, V, kg.device.index)
     # Double-buffered cp.async chunk loop: pays wherever it launches (the
     # unpipelined walk exposes every operand tile's load latency on the
-    # serial chain). Restricted to BC == BT (trivial sub-chunk loop) and
-    # BT >= 64 for now; the fp32-staging removal makes it a distinct
-    # numeric variant, so the small-chunk paths that were tuned and
-    # validated unpipelined keep their bit-exact schedule.
+    # serial chain). Restricted to BC == BT (trivial sub-chunk loop), where
+    # it is bit-identical to the unpipelined schedule, and BT >= 64 for
+    # now; the tuned small-chunk paths keep their validated schedule.
     pipelined = (
         BC == BT
         and BT >= 64
