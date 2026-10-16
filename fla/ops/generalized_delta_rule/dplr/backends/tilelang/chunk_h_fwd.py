@@ -44,23 +44,26 @@ def _chunk_h_fwd_config(K: int, V: int, device_index: int) -> dict[str, int]:
     return {"BV": 16, "threads": 64}
 
 
-def _chunk_h_smem_bytes(BT: int, K: int, BV: int, in_dtype: str, pipelined: bool) -> int:
+def _chunk_h_smem_bytes(
+    BT: int, K: int, BV: int, in_dtype: str, pipelined: bool, stage_bg: bool = True,
+) -> int:
     """Shared-memory footprint of _chunk_dplr_fwd_h_kernel.
 
     Static tiles: the (K, BV) in_dtype state cast tile, the fp32 (BT, BV) v2
     operand tile, the fp32 (BT, K) bg tile, and the fp32 (K,) last-gate row.
     Operand tiles (kg/w (BT, K), v/u (BT, BV)) are double-buffered when
     pipelined; the unpipelined variant instead carries the two fp32 (K, BV)
-    b_hc staging tiles, of which the pipelined variant drops the kg one by
-    keeping that product in a fragment (the bg one stays: writing a single
-    fragment from both the bf16 and fp32 GEMMs fails sm90 layout inference).
+    b_hc staging tiles. The pipelined variant drops the kg staging tile by
+    keeping that product in a fragment, and carries the bg one only when
+    stage_bg is set (required on sm90; see the kernel body).
     """
     elem = dtype_nbytes(in_dtype)
     base = elem * K * BV + 4 * (BT * BV + BT * K + K)
     n_bufs = 2 if pipelined else 1
     base += n_bufs * elem * (2 * BT * K + 2 * BT * BV)
     if pipelined:
-        base += 4 * K * BV
+        if stage_bg:
+            base += 4 * K * BV
     else:
         base += 4 * 2 * K * BV
     return base
@@ -79,6 +82,7 @@ def _chunk_dplr_fwd_h_kernel(
     BV: int = 32,
     threads: int = 128,
     PIPELINED: bool = False,
+    STAGE_BG: bool = True,
 ):
     if PIPELINED:
         # The double-buffered chunk loop prefetches whole BT-row tiles, so
@@ -125,14 +129,16 @@ def _chunk_dplr_fwd_h_kernel(
                 w_shared = T.alloc_shared((n_bufs, BC, K), in_dtype)
                 v_shared = T.alloc_shared((n_bufs, BC, BV), in_dtype)
                 u_shared = T.alloc_shared((n_bufs, BC, BV), in_dtype)
-                # The cc90-proven split from the fused h+o kernel: the kg
-                # product may stay a fragment, but the fp32 bg product must
-                # stage through shared memory - writing one fragment from
-                # both the bf16 and fp32 GEMMs infers conflicting
-                # accumulator layouts on sm90 and fails lowering there.
-                b_hc_kg = T.alloc_fragment((K, BV), acc_dtype)
-                b_hc_bg = T.alloc_fragment((K, BV), acc_dtype)
-                b_hc_bg_shared = T.alloc_shared((K, BV), acc_dtype)
+                if STAGE_BG:
+                    # The cc90-proven split from the fused h+o kernel:
+                    # writing one fragment from both the bf16 and fp32 GEMMs
+                    # infers conflicting accumulator layouts on sm90 and
+                    # fails lowering there, so the fp32 bg product stages
+                    # through shared memory. cc10 lowers the direct
+                    # double-GEMM accumulation and measures faster with it.
+                    b_hc_kg = T.alloc_fragment((K, BV), acc_dtype)
+                    b_hc_bg = T.alloc_fragment((K, BV), acc_dtype)
+                    b_hc_bg_shared = T.alloc_shared((K, BV), acc_dtype)
             else:
                 b_hc_kg = T.alloc_fragment((K, BV), acc_dtype)
                 b_hc_bg = T.alloc_fragment((K, BV), acc_dtype)
@@ -247,26 +253,42 @@ def _chunk_dplr_fwd_h_kernel(
                         if (t < eos) and (g_v < V):
                             v_new[t, i_h, g_v] = T.Cast(in_dtype, v2_frag[c, vv])
 
-                    # b_hc = kg^T @ v + bg^T @ v2.  Same two rounded adds
-                    # as the unpipelined path at BC == BT (bit-identical),
-                    # but only the bg product pays the smem round-trip.
-                    T.gemm(
-                        kg_shared[cur, :, :],
-                        v_shared[cur, :, :],
-                        b_hc_kg,
-                        transpose_A=True,
-                        clear_accum=True,
-                    )
-                    T.gemm(
-                        bg_shared,
-                        v2_shared,
-                        b_hc_bg,
-                        transpose_A=True,
-                        clear_accum=True,
-                    )
-                    T.copy(b_hc_bg, b_hc_bg_shared)
-                    for k_idx, vv in T.Parallel(K, BV):
-                        b_hc[k_idx, vv] = T.ieee_add(b_hc_kg[k_idx, vv], b_hc_bg_shared[k_idx, vv])
+                    # b_hc = kg^T @ v + bg^T @ v2.
+                    if STAGE_BG:
+                        # Same two rounded adds as the unpipelined path at
+                        # BC == BT (bit-identical), but only the bg product
+                        # pays the smem round-trip.
+                        T.gemm(
+                            kg_shared[cur, :, :],
+                            v_shared[cur, :, :],
+                            b_hc_kg,
+                            transpose_A=True,
+                            clear_accum=True,
+                        )
+                        T.gemm(
+                            bg_shared,
+                            v2_shared,
+                            b_hc_bg,
+                            transpose_A=True,
+                            clear_accum=True,
+                        )
+                        T.copy(b_hc_bg, b_hc_bg_shared)
+                        for k_idx, vv in T.Parallel(K, BV):
+                            b_hc[k_idx, vv] = T.ieee_add(b_hc_kg[k_idx, vv], b_hc_bg_shared[k_idx, vv])
+                    else:
+                        T.clear(b_hc)
+                        T.gemm(
+                            kg_shared[cur, :, :],
+                            v_shared[cur, :, :],
+                            b_hc,
+                            transpose_A=True,
+                        )
+                        T.gemm(
+                            bg_shared,
+                            v2_shared,
+                            b_hc,
+                            transpose_A=True,
+                        )
 
                     # Apply decay and accumulate. Clamp last_idx to <= eos-1.
                     last_idx = T.min(chunk_bos + BT - 1, eos - 1)
@@ -441,17 +463,21 @@ def chunk_dplr_fwd_h(
     # serial chain). Restricted to BC == BT (trivial sub-chunk loop), where
     # it is bit-identical to the unpipelined schedule, and BT >= 64 for
     # now; the tuned small-chunk paths keep their validated schedule.
+    # sm90 must stage the bg product through smem (see the kernel body);
+    # cc10 lowers the direct accumulation and measures ~5% faster fwd.
+    stage_bg = cap_major == 9
     pipelined = (
         BC == BT
         and BT >= 64
         and cap_major in (9, 10)
-        and _chunk_h_smem_bytes(BT, K, config["BV"], in_dtype, pipelined=True)
+        and _chunk_h_smem_bytes(BT, K, config["BV"], in_dtype, pipelined=True, stage_bg=stage_bg)
         <= get_device_smem_optin(kg.device.index)
     )
     kernel = _chunk_dplr_fwd_h_kernel(
         H, K, V, BT, BC,
         in_dtype, state_dtype, use_h0, store_ht,
         PIPELINED=pipelined,
+        STAGE_BG=stage_bg,
         **config,
     )
 
