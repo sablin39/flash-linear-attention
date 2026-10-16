@@ -110,6 +110,28 @@ def stream_low_smem_bytes(K: int, V: int, BT: int, in_dtype: str) -> int:
     return stream_reuse_smem_bytes(K, V, BT, in_dtype, stream_low_default_qside_bv(BT))
 
 
+def stream_scan_smem_bytes(K: int, V: int, BT: int, in_dtype: str, num_stages: int = 1) -> int:
+    """Two-pass stream backward, pass 1 (reverse dh scan): the (K, V) dhu
+    cast tile, the (BT, V) dv2 staging tile, the fp32 gk_last row, and the
+    five operand tiles (3x (BT, K), (BT, V), (BT, BT)), double-buffered when
+    pipelined.  At K=V=128, BT=64 the pipelined footprint (197120B bf16) fits
+    a 228KB optin where the fused stream backward (291KB) cannot pipeline."""
+    elem = dtype_nbytes(in_dtype)
+    base = elem * (K * V + 2 * BT * V + 3 * BT * K + BT * BT) + 4 * K
+    if num_stages < 2:
+        return base
+    return base + elem * (3 * BT * K + BT * V + BT * BT)
+
+
+def stream_consumer_smem_bytes(K: int, V: int, BT: int, in_dtype: str) -> int:
+    """Two-pass stream backward, pass 2 (chunk-parallel consumers): the
+    (K, V) h + dhu tiles, 4x (BT, V) + 2x (BT, K) operand tiles, (BT, BT)
+    A_qk, one merged (BT, K) output staging tile, the (BT, V) dv_full
+    staging tile, and the fp32 gk_last row + (4, K) dgk staging."""
+    elem = dtype_nbytes(in_dtype)
+    return elem * (2 * K * V + 5 * BT * V + 3 * BT * K + BT * BT) + 20 * K
+
+
 def stream_bwd_schedule_or_none(
     *,
     K: int,

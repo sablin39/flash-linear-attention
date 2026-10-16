@@ -33,6 +33,10 @@ from .chunk_A_fwd import (
 from .chunk_h_fwd import chunk_dplr_fwd_h
 from .chunk_ho_fwd import chunk_dplr_fwd_ho, chunk_dplr_fwd_ho_ctx
 from .chunk_stream_bwd import chunk_dplr_bwd_stream_into
+from .chunk_stream_bwd_twopass import (
+    chunk_dplr_bwd_stream_twopass_into,
+    stream_bwd_twopass_config_or_none,
+)
 from .cumsum import chunk_local_cumsum
 from .layout import ChunkLayout, build_varlen_chunk_layout
 from .wy_fast_bwd import chunk_dplr_bwd_wy_repr_into
@@ -356,8 +360,18 @@ def _chunk_dplr_delta_rule_bwd_core(
     dw_buf = w if recycle else torch.empty_like(w)
     db_buf = bg if recycle else torch.empty_like(bg)
     dag_buf = ag if recycle else torch.empty_like(ag)
+    # At K=V=128 on cc10 devices whose optin fits both passes, the two-pass
+    # stream backward (scan + chunk-parallel consumers) replaces the fused
+    # stream: the fused kernel cannot pipeline at BT=64 and its (n_seqs, H)
+    # grid starves small batches. Same output contract either way.
+    stream_into = chunk_dplr_bwd_stream_into
+    if stream_bwd_twopass_config_or_none(
+        K=key_dim, V=value_dim, BT=chunk_size,
+        in_dtype=str(qg.dtype).split(".")[-1], device=q.device,
+    ) is not None:
+        stream_into = chunk_dplr_bwd_stream_twopass_into
     dqg, dkg, dw, dbg, dgk_last, dv2, dv_full, dh0 = (
-        chunk_dplr_bwd_stream_into(
+        stream_into(
             qg=qg,
             bg=bg,
             w=w,
