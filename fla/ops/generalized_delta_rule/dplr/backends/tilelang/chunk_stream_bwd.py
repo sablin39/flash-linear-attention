@@ -30,11 +30,18 @@ from .schedules import (
 )
 
 
-def _stream_bwd_config(BT: int, cc: int) -> dict[str, int]:
+def _stream_bwd_config(BT: int, cc: int, V: int) -> dict[str, int]:
     # Micro-autotune on H800 (cc90) shows the high-SMEM schedule is faster with
     # 256 threads for all BT>=32 training shapes, not just K=V=128.
     if cc >= 90 and BT >= 32:
         threads = 256
+    elif cc >= 90 and V >= 128:
+        # BT<=16 with a (128, 128) fp32 dh accumulator: 64 threads need
+        # 256 regs/thread and spill every chunk step (measured on cc10.3:
+        # 5.09 -> 2.07 ms at varlen D128 cs16). 128 threads halve that;
+        # 256 measured no better and does not compile with num_stages=2
+        # (cp.async finds no eligible store at 16-row tiles).
+        threads = 128
     else:
         threads = stream_default_threads(BT)
     return {"threads": threads}
@@ -54,13 +61,13 @@ def _select_stream_bwd_schedule(
     cc = major * 10 + minor
     selected = stream_bwd_schedule_or_none(K=K, V=V, BT=BT, in_dtype=in_dtype, smem_cap=smem_cap)
     if selected == "high":
-        config = _stream_bwd_config(BT, cc)
+        config = _stream_bwd_config(BT, cc, V)
         config["num_stages"] = stream_bwd_num_stages(
             selected, K=K, V=V, BT=BT, in_dtype=in_dtype, smem_cap=smem_cap,
         )
         return "high", config
     if selected == "mid":
-        config = _stream_bwd_config(BT, cc)
+        config = _stream_bwd_config(BT, cc, V)
         config["num_stages"] = stream_bwd_num_stages(
             selected, K=K, V=V, BT=BT, in_dtype=in_dtype, smem_cap=smem_cap,
         )
