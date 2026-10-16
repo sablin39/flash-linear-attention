@@ -32,8 +32,12 @@ from .schedules import dtype_nbytes
 def _ho_smem_bytes(BT: int, K: int, BV: int, in_dtype: str, num_stages: int = 1) -> int:
     elem = dtype_nbytes(in_dtype)
     # Keep this in sync with the shared buffers in _chunk_dplr_fwd_ho_kernel.
+    # The in_dtype terms cover b_h, the 3x (BT, K) + 2x (BT, BV) + 2x (BT, BT)
+    # operand tiles, and the (BT, BV) v2 cast tile the o store stages through;
+    # the fp32 terms cover the two hc staging tiles, the v2 accumulator tile,
+    # bg, and the last-gate row.
     base = (
-        elem * (K * BV + BT * K + BT * K + BT * BV + BT * BV + BT * K + BT * BT + BT * BT)
+        elem * (K * BV + BT * K + BT * K + BT * BV + BT * BV + BT * K + BT * BT + BT * BT + BT * BV)
         + 4 * (K * BV + K * BV + BT * BV + BT * K + K)
     )
     if num_stages < 2:
