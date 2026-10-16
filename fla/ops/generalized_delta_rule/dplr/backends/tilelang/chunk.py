@@ -32,6 +32,7 @@ from .chunk_A_fwd import (
 )
 from .chunk_h_fwd import chunk_dplr_fwd_h
 from .chunk_ho_fwd import chunk_dplr_fwd_ho, chunk_dplr_fwd_ho_ctx
+from .chunk_o_fwd import chunk_dplr_fwd_o
 from .chunk_stream_bwd import chunk_dplr_bwd_stream_into
 from .chunk_stream_bwd_twopass import (
     chunk_dplr_bwd_stream_twopass_into,
@@ -88,6 +89,18 @@ def _resolve_disable_recompute(
         )
         _auto_dr_logged = True
     return True
+
+
+def _use_split_ho_fwd(chunk_size: int, device: torch.device) -> bool:
+    # Split the BT=64 forward h+o pass into the serial h kernel (which
+    # materializes per-chunk states for the chunk-parallel o kernel) on
+    # cc9/cc10: the fused pass cannot pipeline at BT=64, K=V=128 there (its
+    # BV=64 two-stage footprint exceeds the 232448B optin) and its serial
+    # walk carries the o GEMMs at ~0.55x vs Triton's split kernels. cc120
+    # keeps the fused path that its cs64 wins were measured on.
+    if chunk_size < 64 or not torch.cuda.is_available():
+        return False
+    return get_device_capability(device.index or 0)[0] in (9, 10)
 
 
 class _DPLRCheckpointPhaseMode(TorchDispatchMode):
@@ -734,22 +747,48 @@ def _chunk_dplr_delta_rule_fwd_op(
             context=cp_context,
             chunk_size=chunk_size,
         )
-    o, final_state = chunk_dplr_fwd_ho(
-        qg=qg,
-        kg=kg,
-        v=v,
-        w=w,
-        u=u,
-        bg=bg,
-        gk=gi,
-        A_qk=A_qk,
-        A_qb=A_qb,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu,
-        chunk_size=chunk_size,
-        chunk_layout=layout,
-    )
+    if _use_split_ho_fwd(chunk_size, q.device):
+        h, v_new, final_state = chunk_dplr_fwd_h(
+            kg=kg,
+            v=v,
+            w=w,
+            u=u,
+            bg=bg,
+            gk=gi,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu,
+            chunk_size=chunk_size,
+            chunk_layout=layout,
+        )
+        o = chunk_dplr_fwd_o(
+            qg=qg,
+            v=v,
+            v_new=v_new,
+            A_qk=A_qk,
+            A_qb=A_qb,
+            h=h,
+            cu_seqlens=cu,
+            chunk_size=chunk_size,
+            chunk_layout=layout,
+        )
+    else:
+        o, final_state = chunk_dplr_fwd_ho(
+            qg=qg,
+            kg=kg,
+            v=v,
+            w=w,
+            u=u,
+            bg=bg,
+            gk=gi,
+            A_qk=A_qk,
+            A_qb=A_qb,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu,
+            chunk_size=chunk_size,
+            chunk_layout=layout,
+        )
 
     if final_state is None:
         final_state = q.new_empty((0,), dtype=torch.float32)
@@ -893,23 +932,59 @@ def _chunk_dplr_delta_rule_fwd_ctx_core(
             context=cp_context,
             chunk_size=chunk_size,
         )
-    o, final_state, h_ctx, v_new_ctx = chunk_dplr_fwd_ho_ctx(
-        qg=qg,
-        kg=kg,
-        v=v,
-        w=w,
-        u=u,
-        bg=bg,
-        gk=gi,
-        A_qk=A_qk,
-        A_qb=A_qb,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu,
-        chunk_size=chunk_size,
-        chunk_layout=layout,
-        store_context=store_context,
-    )
+    if _use_split_ho_fwd(chunk_size, q.device):
+        H, K = q.shape[2], q.shape[3]
+        V = v.shape[-1]
+        h, v_new, final_state = chunk_dplr_fwd_h(
+            kg=kg,
+            v=v,
+            w=w,
+            u=u,
+            bg=bg,
+            gk=gi,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu,
+            chunk_size=chunk_size,
+            chunk_layout=layout,
+        )
+        o = chunk_dplr_fwd_o(
+            qg=qg,
+            v=v,
+            v_new=v_new,
+            A_qk=A_qk,
+            A_qb=A_qb,
+            h=h,
+            cu_seqlens=cu,
+            chunk_size=chunk_size,
+            chunk_layout=layout,
+        )
+        # The h pass always materializes per-chunk states; only retain them
+        # for the backward when the caller asked for the saved-tensor path.
+        if store_context:
+            h_ctx = h.reshape(-1, H, K, V)
+            v_new_ctx = v_new
+        else:
+            h_ctx = kg.new_empty((1,)).expand(h.reshape(-1, H, K, V).shape)
+            v_new_ctx = v.new_empty((1,)).expand(v_new.shape)
+    else:
+        o, final_state, h_ctx, v_new_ctx = chunk_dplr_fwd_ho_ctx(
+            qg=qg,
+            kg=kg,
+            v=v,
+            w=w,
+            u=u,
+            bg=bg,
+            gk=gi,
+            A_qk=A_qk,
+            A_qb=A_qb,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu,
+            chunk_size=chunk_size,
+            chunk_layout=layout,
+            store_context=store_context,
+        )
 
     if final_state is None:
         final_state = q.new_empty((0,), dtype=torch.float32)

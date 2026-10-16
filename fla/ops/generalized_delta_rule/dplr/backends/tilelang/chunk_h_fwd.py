@@ -25,9 +25,10 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from fla.utils import get_device_capability
+from fla.utils import get_device_capability, get_device_smem_optin
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
+from .schedules import dtype_nbytes
 
 
 def _chunk_h_fwd_config(K: int, V: int, device_index: int) -> dict[str, int]:
@@ -43,6 +44,25 @@ def _chunk_h_fwd_config(K: int, V: int, device_index: int) -> dict[str, int]:
     return {"BV": 16, "threads": 64}
 
 
+def _chunk_h_smem_bytes(BT: int, K: int, BV: int, in_dtype: str, pipelined: bool) -> int:
+    """Shared-memory footprint of _chunk_dplr_fwd_h_kernel.
+
+    Static tiles: the (K, BV) in_dtype state cast tile, the fp32 (BT, BV) v2
+    operand tile, the fp32 (BT, K) bg tile, and the fp32 (K,) last-gate row.
+    Operand tiles (kg/w (BT, K), v/u (BT, BV)) are double-buffered when
+    pipelined; the unpipelined variant instead carries the two fp32 (K, BV)
+    b_hc staging tiles, which the pipelined variant removes by accumulating
+    both outer-product GEMMs straight into b_hc.
+    """
+    elem = dtype_nbytes(in_dtype)
+    base = elem * K * BV + 4 * (BT * BV + BT * K + K)
+    n_bufs = 2 if pipelined else 1
+    base += n_bufs * elem * (2 * BT * K + 2 * BT * BV)
+    if not pipelined:
+        base += 4 * 2 * K * BV
+    return base
+
+
 @tilelang.jit(
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
                   tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: False,
@@ -55,7 +75,12 @@ def _chunk_dplr_fwd_h_kernel(
     STORE_FINAL_STATE: bool,
     BV: int = 32,
     threads: int = 128,
+    PIPELINED: bool = False,
 ):
+    if PIPELINED:
+        # The double-buffered chunk loop prefetches whole BT-row tiles, so
+        # the sub-chunk loop must be trivial.
+        assert BC == BT, "PIPELINED requires BC == BT"
     acc_dtype = "float32"
     n_tokens, n_seq_plus_one, n_chunks, n_h0, n_ht = T.dynamic(
         "n_tokens, n_seq_plus_one, n_chunks, n_h0, n_ht"
@@ -87,18 +112,25 @@ def _chunk_dplr_fwd_h_kernel(
             b_h = T.alloc_fragment((K, BV), acc_dtype)
             b_h_shared = T.alloc_shared((K, BV), in_dtype)
             b_hc = T.alloc_fragment((K, BV), acc_dtype)
-            b_hc_kg = T.alloc_fragment((K, BV), acc_dtype)
-            b_hc_bg = T.alloc_fragment((K, BV), acc_dtype)
-            b_hc_kg_shared = T.alloc_shared((K, BV), acc_dtype)
-            b_hc_bg_shared = T.alloc_shared((K, BV), acc_dtype)
             v2_frag = T.alloc_fragment((BC, BV), acc_dtype)
             v2_shared = T.alloc_shared((BC, BV), acc_dtype)
-            kg_shared = T.alloc_shared((BC, K), in_dtype)
             bg_shared = T.alloc_shared((BC, K), acc_dtype)
-            w_shared = T.alloc_shared((BC, K), in_dtype)
-            v_shared = T.alloc_shared((BC, BV), in_dtype)
-            u_shared = T.alloc_shared((BC, BV), in_dtype)
             gk_last_shared = T.alloc_shared((K,), acc_dtype)
+            if PIPELINED:
+                n_bufs = 2
+                kg_shared = T.alloc_shared((n_bufs, BC, K), in_dtype)
+                w_shared = T.alloc_shared((n_bufs, BC, K), in_dtype)
+                v_shared = T.alloc_shared((n_bufs, BC, BV), in_dtype)
+                u_shared = T.alloc_shared((n_bufs, BC, BV), in_dtype)
+            else:
+                b_hc_kg = T.alloc_fragment((K, BV), acc_dtype)
+                b_hc_bg = T.alloc_fragment((K, BV), acc_dtype)
+                b_hc_kg_shared = T.alloc_shared((K, BV), acc_dtype)
+                b_hc_bg_shared = T.alloc_shared((K, BV), acc_dtype)
+                kg_shared = T.alloc_shared((BC, K), in_dtype)
+                w_shared = T.alloc_shared((BC, K), in_dtype)
+                v_shared = T.alloc_shared((BC, BV), in_dtype)
+                u_shared = T.alloc_shared((BC, BV), in_dtype)
 
             # Init state.
             if USE_INITIAL_STATE:
@@ -112,89 +144,211 @@ def _chunk_dplr_fwd_h_kernel(
                 for k_idx, vv in T.Parallel(K, BV):
                     b_h[k_idx, vv] = 0.0
 
-            # Per-chunk loop.
-            for i_t in T.serial(n_chunks):
-                # FLA computes w @ h with h rounded to the input dtype, while the
-                # recurrent state itself remains fp32 across chunks.
-                T.copy(b_h, b_h_shared)
-                for k_idx, vv in T.Parallel(K, BV):
-                    g_v = i_v * BV + vv
-                    if g_v < V:
-                        h[boh + i_t, i_h, k_idx, g_v] = b_h_shared[k_idx, vv]
-
-                T.clear(b_hc)
-
-                # Sub-chunk loop.
-                NC = T.ceildiv(BT, BC)
-                for i_c in T.serial(NC):
-                    t_off = bos + i_t * BT + i_c * BC
-
-                    # Load tiles with zero-padding for partial varlen chunks.
-                    for c, k_idx in T.Parallel(BC, K):
-                        if t_off + c < eos:
-                            kg_shared[c, k_idx] = kg[t_off + c, i_h, k_idx]
-                            bg_shared[c, k_idx] = T.Cast(acc_dtype, bg[t_off + c, i_h, k_idx])
-                            w_shared[c, k_idx] = w[t_off + c, i_h, k_idx]
+            if PIPELINED:
+                # Prologue: fill buffer 0 with chunk 0's operand tiles.
+                if bos + BT <= eos:
+                    T.copy(kg[bos: bos + BT, i_h, 0:K], kg_shared[0, :, :])
+                    T.copy(w[bos: bos + BT, i_h, 0:K], w_shared[0, :, :])
+                    T.copy(v[bos: bos + BT, i_h, i_v * BV: i_v * BV + BV], v_shared[0, :, :])
+                    T.copy(u[bos: bos + BT, i_h, i_v * BV: i_v * BV + BV], u_shared[0, :, :])
+                else:
+                    for c, k_idx in T.Parallel(BT, K):
+                        if bos + c < eos:
+                            kg_shared[0, c, k_idx] = kg[bos + c, i_h, k_idx]
+                            w_shared[0, c, k_idx] = w[bos + c, i_h, k_idx]
                         else:
-                            kg_shared[c, k_idx] = T.Cast(in_dtype, 0.0)
-                            bg_shared[c, k_idx] = 0.0
-                            w_shared[c, k_idx] = T.Cast(in_dtype, 0.0)
-                    for c, vv in T.Parallel(BC, BV):
+                            kg_shared[0, c, k_idx] = T.Cast(in_dtype, 0.0)
+                            w_shared[0, c, k_idx] = T.Cast(in_dtype, 0.0)
+                    for c, vv in T.Parallel(BT, BV):
                         g_v = i_v * BV + vv
-                        if (t_off + c < eos) and (g_v < V):
-                            v_shared[c, vv] = v[t_off + c, i_h, g_v]
-                            u_shared[c, vv] = u[t_off + c, i_h, g_v]
+                        if (bos + c < eos) and (g_v < V):
+                            v_shared[0, c, vv] = v[bos + c, i_h, g_v]
+                            u_shared[0, c, vv] = u[bos + c, i_h, g_v]
                         else:
-                            v_shared[c, vv] = T.Cast(in_dtype, 0.0)
-                            u_shared[c, vv] = T.Cast(in_dtype, 0.0)
+                            v_shared[0, c, vv] = T.Cast(in_dtype, 0.0)
+                            u_shared[0, c, vv] = T.Cast(in_dtype, 0.0)
 
-                    T.gemm(w_shared, b_h_shared, v2_frag, clear_accum=True)
-                    for c, vv in T.Parallel(BC, BV):
-                        v2_frag[c, vv] = T.ieee_add(v2_frag[c, vv], T.Cast(acc_dtype, u_shared[c, vv]))
+                for i_t in T.serial(n_chunks):
+                    chunk_bos = bos + i_t * BT
+                    cur = i_t % 2
+
+                    # FLA computes w @ h with h rounded to the input dtype, while the
+                    # recurrent state itself remains fp32 across chunks.
+                    T.copy(b_h, b_h_shared)
+                    for k_idx, vv in T.Parallel(K, BV):
+                        g_v = i_v * BV + vv
+                        if g_v < V:
+                            h[boh + i_t, i_h, k_idx, g_v] = b_h_shared[k_idx, vv]
+
+                    T.clear(b_hc)
+
+                    # The idle buffer's previous readers must finish before
+                    # the cp.async below overwrites it.
+                    T.sync_threads()
+                    if i_t + 1 < n_chunks:
+                        nxt = (i_t + 1) % 2
+                        nxt_bos = chunk_bos + BT
+                        if nxt_bos + BT <= eos:
+                            # Full tiles only: 4 operand tiles, one commit
+                            # group per async_copy.
+                            T.async_copy(kg[nxt_bos: nxt_bos + BT, i_h, 0:K], kg_shared[nxt, :, :])
+                            T.async_copy(w[nxt_bos: nxt_bos + BT, i_h, 0:K], w_shared[nxt, :, :])
+                            T.async_copy(v[nxt_bos: nxt_bos + BT, i_h, i_v * BV: i_v * BV + BV],
+                                         v_shared[nxt, :, :])
+                            T.async_copy(u[nxt_bos: nxt_bos + BT, i_h, i_v * BV: i_v * BV + BV],
+                                         u_shared[nxt, :, :])
+                            # Leave the 4 just issued groups pending, wait for
+                            # the 4 issued for the current buffer last round.
+                            T.ptx_wait_group(4)
+                        else:
+                            for c, k_idx in T.Parallel(BT, K):
+                                if nxt_bos + c < eos:
+                                    kg_shared[nxt, c, k_idx] = kg[nxt_bos + c, i_h, k_idx]
+                                    w_shared[nxt, c, k_idx] = w[nxt_bos + c, i_h, k_idx]
+                                else:
+                                    kg_shared[nxt, c, k_idx] = T.Cast(in_dtype, 0.0)
+                                    w_shared[nxt, c, k_idx] = T.Cast(in_dtype, 0.0)
+                            for c, vv in T.Parallel(BT, BV):
+                                g_v = i_v * BV + vv
+                                if (nxt_bos + c < eos) and (g_v < V):
+                                    v_shared[nxt, c, vv] = v[nxt_bos + c, i_h, g_v]
+                                    u_shared[nxt, c, vv] = u[nxt_bos + c, i_h, g_v]
+                                else:
+                                    v_shared[nxt, c, vv] = T.Cast(in_dtype, 0.0)
+                                    u_shared[nxt, c, vv] = T.Cast(in_dtype, 0.0)
+                            T.ptx_wait_group(0)
+                    else:
+                        T.ptx_wait_group(0)
+
+                    for c, k_idx in T.Parallel(BT, K):
+                        t = chunk_bos + c
+                        if t < eos:
+                            bg_shared[c, k_idx] = T.Cast(acc_dtype, bg[t, i_h, k_idx])
+                        else:
+                            bg_shared[c, k_idx] = 0.0
+
+                    T.gemm(w_shared[cur, :, :], b_h_shared, v2_frag, clear_accum=True)
+                    for c, vv in T.Parallel(BT, BV):
+                        v2_frag[c, vv] = T.ieee_add(v2_frag[c, vv], T.Cast(acc_dtype, u_shared[cur, c, vv]))
                     T.copy(v2_frag, v2_shared)
 
-                    for c, vv in T.Parallel(BC, BV):
+                    for c, vv in T.Parallel(BT, BV):
                         g_v = i_v * BV + vv
-                        if (t_off + c < eos) and (g_v < V):
-                            v_new[t_off + c, i_h, g_v] = T.Cast(in_dtype, v2_frag[c, vv])
+                        t = chunk_bos + c
+                        if (t < eos) and (g_v < V):
+                            v_new[t, i_h, g_v] = T.Cast(in_dtype, v2_frag[c, vv])
 
-                    # b_hc += kg^T @ v + bg^T @ v2.  The second product stays in
-                    # fp32 because FLA casts bg to fp32 and consumes fp32 v2 here.
+                    # b_hc += kg^T @ v + bg^T @ v2, accumulated straight into
+                    # b_hc (fp32) instead of the unpipelined path's staged
+                    # per-product tiles; same fp32 add set, different order.
                     T.gemm(
-                        kg_shared,
-                        v_shared,
-                        b_hc_kg,
+                        kg_shared[cur, :, :],
+                        v_shared[cur, :, :],
+                        b_hc,
                         transpose_A=True,
-                        clear_accum=True,
                     )
-                    T.copy(b_hc_kg, b_hc_kg_shared)
                     T.gemm(
                         bg_shared,
                         v2_shared,
-                        b_hc_bg,
+                        b_hc,
                         transpose_A=True,
-                        clear_accum=True,
                     )
-                    T.copy(b_hc_bg, b_hc_bg_shared)
-                    for k_idx, vv in T.Parallel(K, BV):
-                        b_hc[k_idx, vv] = T.ieee_add(
-                            T.ieee_add(b_hc[k_idx, vv], b_hc_kg_shared[k_idx, vv]),
-                            b_hc_bg_shared[k_idx, vv],
-                        )
 
-                # Apply decay and accumulate. Clamp last_idx to <= eos-1.
-                last_idx = T.min(bos + (i_t + 1) * BT - 1, eos - 1)
-                for k_idx in T.Parallel(K):
-                    gk_last_shared[k_idx] = gk[last_idx, i_h, k_idx]
-                # Match FLA's two-step update order:
-                #   b_h *= exp2(g_last)
-                #   b_h += b_hc
-                # Keeping these as separate statements avoids contracting the
-                # recurrent state update into a different fp32 expression.
-                for k_idx, vv in T.Parallel(K, BV):
-                    b_h[k_idx, vv] = T.ieee_mul(T.exp2(gk_last_shared[k_idx]), b_h[k_idx, vv])
-                for k_idx, vv in T.Parallel(K, BV):
-                    b_h[k_idx, vv] = T.ieee_add(b_h[k_idx, vv], b_hc[k_idx, vv])
+                    # Apply decay and accumulate. Clamp last_idx to <= eos-1.
+                    last_idx = T.min(chunk_bos + BT - 1, eos - 1)
+                    for k_idx in T.Parallel(K):
+                        gk_last_shared[k_idx] = gk[last_idx, i_h, k_idx]
+                    # Match FLA's two-step update order:
+                    #   b_h *= exp2(g_last)
+                    #   b_h += b_hc
+                    for k_idx, vv in T.Parallel(K, BV):
+                        b_h[k_idx, vv] = T.ieee_mul(T.exp2(gk_last_shared[k_idx]), b_h[k_idx, vv])
+                    for k_idx, vv in T.Parallel(K, BV):
+                        b_h[k_idx, vv] = T.ieee_add(b_h[k_idx, vv], b_hc[k_idx, vv])
+            else:
+                # Per-chunk loop.
+                for i_t in T.serial(n_chunks):
+                    # FLA computes w @ h with h rounded to the input dtype, while the
+                    # recurrent state itself remains fp32 across chunks.
+                    T.copy(b_h, b_h_shared)
+                    for k_idx, vv in T.Parallel(K, BV):
+                        g_v = i_v * BV + vv
+                        if g_v < V:
+                            h[boh + i_t, i_h, k_idx, g_v] = b_h_shared[k_idx, vv]
+
+                    T.clear(b_hc)
+
+                    # Sub-chunk loop.
+                    NC = T.ceildiv(BT, BC)
+                    for i_c in T.serial(NC):
+                        t_off = bos + i_t * BT + i_c * BC
+
+                        # Load tiles with zero-padding for partial varlen chunks.
+                        for c, k_idx in T.Parallel(BC, K):
+                            if t_off + c < eos:
+                                kg_shared[c, k_idx] = kg[t_off + c, i_h, k_idx]
+                                bg_shared[c, k_idx] = T.Cast(acc_dtype, bg[t_off + c, i_h, k_idx])
+                                w_shared[c, k_idx] = w[t_off + c, i_h, k_idx]
+                            else:
+                                kg_shared[c, k_idx] = T.Cast(in_dtype, 0.0)
+                                bg_shared[c, k_idx] = 0.0
+                                w_shared[c, k_idx] = T.Cast(in_dtype, 0.0)
+                        for c, vv in T.Parallel(BC, BV):
+                            g_v = i_v * BV + vv
+                            if (t_off + c < eos) and (g_v < V):
+                                v_shared[c, vv] = v[t_off + c, i_h, g_v]
+                                u_shared[c, vv] = u[t_off + c, i_h, g_v]
+                            else:
+                                v_shared[c, vv] = T.Cast(in_dtype, 0.0)
+                                u_shared[c, vv] = T.Cast(in_dtype, 0.0)
+
+                        T.gemm(w_shared, b_h_shared, v2_frag, clear_accum=True)
+                        for c, vv in T.Parallel(BC, BV):
+                            v2_frag[c, vv] = T.ieee_add(v2_frag[c, vv], T.Cast(acc_dtype, u_shared[c, vv]))
+                        T.copy(v2_frag, v2_shared)
+
+                        for c, vv in T.Parallel(BC, BV):
+                            g_v = i_v * BV + vv
+                            if (t_off + c < eos) and (g_v < V):
+                                v_new[t_off + c, i_h, g_v] = T.Cast(in_dtype, v2_frag[c, vv])
+
+                        # b_hc += kg^T @ v + bg^T @ v2.  The second product stays in
+                        # fp32 because FLA casts bg to fp32 and consumes fp32 v2 here.
+                        T.gemm(
+                            kg_shared,
+                            v_shared,
+                            b_hc_kg,
+                            transpose_A=True,
+                            clear_accum=True,
+                        )
+                        T.copy(b_hc_kg, b_hc_kg_shared)
+                        T.gemm(
+                            bg_shared,
+                            v2_shared,
+                            b_hc_bg,
+                            transpose_A=True,
+                            clear_accum=True,
+                        )
+                        T.copy(b_hc_bg, b_hc_bg_shared)
+                        for k_idx, vv in T.Parallel(K, BV):
+                            b_hc[k_idx, vv] = T.ieee_add(
+                                T.ieee_add(b_hc[k_idx, vv], b_hc_kg_shared[k_idx, vv]),
+                                b_hc_bg_shared[k_idx, vv],
+                            )
+
+                    # Apply decay and accumulate. Clamp last_idx to <= eos-1.
+                    last_idx = T.min(bos + (i_t + 1) * BT - 1, eos - 1)
+                    for k_idx in T.Parallel(K):
+                        gk_last_shared[k_idx] = gk[last_idx, i_h, k_idx]
+                    # Match FLA's two-step update order:
+                    #   b_h *= exp2(g_last)
+                    #   b_h += b_hc
+                    # Keeping these as separate statements avoids contracting the
+                    # recurrent state update into a different fp32 expression.
+                    for k_idx, vv in T.Parallel(K, BV):
+                        b_h[k_idx, vv] = T.ieee_mul(T.exp2(gk_last_shared[k_idx]), b_h[k_idx, vv])
+                    for k_idx, vv in T.Parallel(K, BV):
+                        b_h[k_idx, vv] = T.ieee_add(b_h[k_idx, vv], b_hc[k_idx, vv])
 
             # Store final state.
             if STORE_FINAL_STATE:
@@ -267,10 +421,25 @@ def chunk_dplr_fwd_h(
     u_f = u.reshape(token_rows, H, V).contiguous()
     gk_f = gk.reshape(token_rows, H, K).contiguous()
 
+    config = _chunk_h_fwd_config(K, V, kg.device.index)
+    # Double-buffered cp.async chunk loop: pays wherever it launches (the
+    # unpipelined walk exposes every operand tile's load latency on the
+    # serial chain). Restricted to BC == BT (trivial sub-chunk loop) and
+    # BT >= 64 for now; the fp32-staging removal makes it a distinct
+    # numeric variant, so the small-chunk paths that were tuned and
+    # validated unpipelined keep their bit-exact schedule.
+    pipelined = (
+        BC == BT
+        and BT >= 64
+        and cap_major in (9, 10)
+        and _chunk_h_smem_bytes(BT, K, config["BV"], in_dtype, pipelined=True)
+        <= get_device_smem_optin(kg.device.index)
+    )
     kernel = _chunk_dplr_fwd_h_kernel(
         H, K, V, BT, BC,
         in_dtype, state_dtype, use_h0, store_ht,
-        **_chunk_h_fwd_config(K, V, kg.device.index),
+        PIPELINED=pipelined,
+        **config,
     )
 
     h_flat = torch.empty((chunk_rows, H, K, V), dtype=kg.dtype, device=kg.device)
