@@ -686,10 +686,10 @@ def _chunk_dplr_delta_rule_fwd_op(
     )
     initial_state = h0 if has_initial_state else None
 
-    # from_gk (in-CTA chunk-local cumsum from bf16 gk) is the default A-stage
-    # for head_dim 64, in training and eval, rectangular and varlen.  It
-    # removes the standalone fp32 gi/ge cumsum kernels and the fp32 ge tensor.
-    use_from_gk_a = q.shape[-1] == 64
+    # from_gk (in-CTA chunk-local cumsum from bf16 gk) is the default A-stage,
+    # in training and eval, rectangular and varlen.  It removes the standalone
+    # fp32 gi/ge cumsum kernels and the fp32 ge tensor.
+    use_from_gk_a = q.shape[-1] in (64, 128)
     if use_from_gk_a:
         A_ab, A_qk, A_ak, A_qb, qg, kg, ag, bg, gi = chunk_dplr_fwd_intra_from_gk(
             q=q,
@@ -872,10 +872,10 @@ def _chunk_dplr_delta_rule_fwd_ctx_core(
     )
     initial_state = h0 if has_initial_state else None
 
-    # Same A-stage split as the plain forward: from_gk (in-CTA cumsum) at
-    # head_dim 64 avoids the standalone cumsum and the intra variant's
-    # torch-side gate preparation entirely.
-    if q.shape[-1] == 64:
+    # Same A-stage split as the plain forward: from_gk (in-CTA cumsum) avoids
+    # the standalone cumsum and the intra variant's torch-side gate
+    # preparation entirely.
+    if q.shape[-1] in (64, 128):
         A_ab, A_qk, A_ak, A_qb, qg, kg, ag, bg, gi = chunk_dplr_fwd_intra_from_gk(
             q=q,
             k=k,

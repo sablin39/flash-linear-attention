@@ -360,7 +360,7 @@ def _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
     threads: int = 128,
     gk_dtype: str | None = None,
 ):
-    """K=64 A-stage with the chunk-local gi cumsum computed inside the CTA."""
+    """A-stage with the chunk-local gi cumsum computed inside the CTA."""
     acc_dtype = "float32"
     # fp16 cannot hold the centered exp2 operands (|centered_gi| can reach
     # ~115 log2 at BT=32); keep the q-side GEMM operands in fp32 there, as
@@ -421,8 +421,8 @@ def _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
             # hoist the gk tile into shared for the serial scan; the gating
             # loop below re-reads gk from global (L2-resident by then), which
             # ends this tile's lifetime at the scan and lets the allocator
-            # overlap it with the fp32 operand tiles — needed to fit a 99KB
-            # smem cap at BT=64 with fp32 gates
+            # overlap it with the fp32 operand tiles — needed to stay under
+            # the smem cap at BT=64 with fp32 gates
             gk_shared = T.alloc_shared((BT, K), gk_dtype)
             for r, c in T.Parallel(BT, K):
                 t = bos + r
@@ -565,8 +565,8 @@ def chunk_dplr_fwd_intra_from_gk(
 ) -> tuple[torch.Tensor, ...]:
     B, T_, H, K = q.shape
     BT = int(chunk_size)
-    if K != 64:
-        raise NotImplementedError("chunk_dplr_fwd_intra_from_gk is currently validated only for K=64.")
+    if K not in (64, 128):
+        raise NotImplementedError("chunk_dplr_fwd_intra_from_gk is currently validated only for head_dim 64 and 128.")
 
     is_varlen = cu_seqlens is not None
     if is_varlen:
