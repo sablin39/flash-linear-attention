@@ -39,6 +39,11 @@ def _wy_bwd_config(BT: int, device: torch.device) -> dict[str, int]:
     if BT <= 16:
         return {"threads": 32, "bulk_copy": False}
     cc = device_cc(device)
+    if cc == 103 and BT >= 64:
+        # bulk copies win on cc10.3 too, but with 128 threads: -52% (D128)
+        # / -63% (D64) vs the scalar fallback, while the cc90/cc120-style
+        # 256-thread variant only reaches -42% (D128) / -7% (D64).
+        return {"threads": 128, "bulk_copy": True}
     if cc == 90:
         return {"threads": 128 if BT < 64 else 256, "bulk_copy": True}
     if cc == 120 and BT >= 64:
