@@ -23,7 +23,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from fla.utils import get_device_capability, get_device_smem_optin
+from fla.utils import get_device_capability, get_device_smem_optin, get_multiprocessor_count
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
 from .schedules import dtype_nbytes
@@ -52,7 +52,8 @@ def _ho_fwd_num_stages(BT: int, K: int, BV: int, in_dtype: str, device_index: in
     return 0
 
 
-def _ho_fwd_config(K: int, V: int, BT: int, in_dtype: str, device_index: int) -> dict[str, int]:
+def _ho_fwd_config(K: int, V: int, BT: int, in_dtype: str, device_index: int,
+                   n_seqs: int | None = None, H: int | None = None) -> dict[str, int]:
     if not torch.cuda.is_available():
         return {"BV": 16, "threads": 64}
     major = get_device_capability(device_index)[0]
@@ -67,6 +68,17 @@ def _ho_fwd_config(K: int, V: int, BT: int, in_dtype: str, device_index: int) ->
     if BT <= 16:
         # 16-row GEMMs only partition across <= 2 warps (m_warp x n_warp must
         # equal num_warps with >= 16 rows and >= 8 cols per warp).
+        if major == 10:
+            # measured on cc10.3 (L20D): the serial chunk chain is
+            # occupancy-bound at (V/BV)xNxH blocks, so BV=16 quadruples the
+            # block count and wins 23% on small grids; K=64 grids that
+            # already fill the device prefer BV=64 (fewer redundant operand
+            # loads), while K=128 prefers BV=16 even on full grids
+            if K <= 64 and n_seqs is not None and H is not None:
+                sm = get_multiprocessor_count(device_index)
+                if n_seqs * H * (-(-V // 64)) >= sm:
+                    return {"BV": pick([64, 32, 16]), "threads": 64}
+            return {"BV": pick([16, 32, 64]), "threads": 64}
         return {"BV": pick([64, 32, 16]), "threads": 64}
     elif major >= 9 and K <= 128:
         return {"BV": pick([64, 32, 16]), "threads": 256}
@@ -462,7 +474,10 @@ def chunk_dplr_fwd_ho(
     )
     qg_f, kg_f, v_f, w_f, u_f, bg_f, gk_f, A_qk_f, A_qb_f = flats
 
-    config = _ho_fwd_config(K, V, chunk_size, in_dtype, kg.device.index)
+    config = _ho_fwd_config(
+        K, V, chunk_size, in_dtype, kg.device.index,
+        n_seqs=layout.cu_seqlens.shape[0] - 1, H=H,
+    )
     merge_flags = _ho_fragment_merge_flags(
         K, V, chunk_size, in_dtype, False, config,
         device_index=kg.device.index,
@@ -516,7 +531,10 @@ def chunk_dplr_fwd_ho_ctx(
     chunk_rows = layout.chunk_indices.shape[0]
     token_rows = B * T_
 
-    config = _ho_fwd_config(K, V, chunk_size, in_dtype, kg.device.index)
+    config = _ho_fwd_config(
+        K, V, chunk_size, in_dtype, kg.device.index,
+        n_seqs=layout.cu_seqlens.shape[0] - 1, H=H,
+    )
     merge_flags = _ho_fragment_merge_flags(
         K, V, chunk_size, in_dtype, store_context, config,
         device_index=kg.device.index,

@@ -34,6 +34,10 @@ def _chunk_h_fwd_config(K: int, V: int, device_index: int) -> dict[str, int]:
     cap_major = get_device_capability(device_index)[0]
     if cap_major == 9 and K <= 128:
         return {"BV": 64 if V >= 64 else 32 if V >= 32 else 16, "threads": 256}
+    elif cap_major == 10 and K <= 128:
+        # measured on cc10.3 (L20D): the cc9 tile shape is bit-exact vs the
+        # generic fallback and 15-32% faster across BT 16/32/64
+        return {"BV": 64 if V >= 64 else 32 if V >= 32 else 16, "threads": 256}
     elif cap_major == 8:
         return {"BV": 32 if V >= 32 else 16, "threads": 128}
     return {"BV": 16, "threads": 64}
@@ -234,7 +238,9 @@ def chunk_dplr_fwd_h(
     # halves changes the fp32 accumulation order and was enough to create rare
     # one-ULP bf16 output spikes at long varlen sequence lengths.
     cap_major = get_device_capability(kg.device.index)[0]
-    if cap_major == 9:
+    if cap_major in (9, 10):
+        # cc10.3 (L20D) also measures 41-49% faster with the unsplit
+        # sub-block; the accumulation reorder is within suite tolerance
         BC = min(BT, 64 if K <= 128 else 32)
     elif cap_major == 8:
         BC = min(BT, 32)

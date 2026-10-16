@@ -7,6 +7,8 @@
 
 """Low-retention DPLR path with FLA-compatible active-varlen semantics."""
 
+import logging
+import os
 from contextvars import ContextVar
 
 import torch
@@ -19,6 +21,7 @@ from fla.ops.cp.chunk_delta_h import (
 )
 from fla.ops.generalized_delta_rule.dplr.chunk_o_bwd import chunk_dplr_bwd_dAu
 from fla.ops.utils.constant import RCP_LN2
+from fla.utils import get_device_capability
 
 from .chunk_A_bwd import (
     chunk_dplr_bwd_dqk_intra_fused_qside_into,
@@ -46,6 +49,41 @@ _DPLR_CHECKPOINT_PHASE: ContextVar[str] = ContextVar(
 # Active FLACPContext for the duration of a CP call. Custom ops cannot take
 # the context object, so it is threaded through a ContextVar instead.
 _DPLR_CP_CONTEXT: ContextVar = ContextVar("fla_dplr_cp_context", default=None)
+
+logger = logging.getLogger(__name__)
+
+# Escape hatch for the cc10.3 auto disable_recompute below: unset = auto,
+# "1" = force saved-tensor path, "0" = force recompute path.
+_AUTO_DR_ENV = "FLA_DPLR_TILELANG_AUTO_DISABLE_RECOMPUTE"
+_auto_dr_logged = False
+
+
+def _resolve_disable_recompute(
+    disable_recompute: bool,
+    device: torch.device,
+    cp_context,
+) -> bool:
+    env = os.environ.get(_AUTO_DR_ENV)
+    if env == "1":
+        return True
+    if disable_recompute or cp_context is not None or env == "0":
+        return disable_recompute
+    if get_device_capability(device.index or 0) != (10, 3):
+        return False
+    # Measured on cc10.3 (L20D): the recompute path replays the serial
+    # state-pass chain at <3% occupancy, so keeping per-chunk h/v_new and
+    # the wy intermediates saves 21-35% fwd+bwd on every benchmarked
+    # config. TileLang on cc10.3 is otherwise verifier-rejected, so this
+    # only steers opt-in callers; the extra memory is the documented
+    # disable_recompute cost.
+    global _auto_dr_logged
+    if not _auto_dr_logged:
+        logger.info(
+            "TileLang DPLR: enabling disable_recompute on cc10.3 "
+            f"(21-35%% fwd+bwd measured); set {_AUTO_DR_ENV}=0 to force recomputation"
+        )
+        _auto_dr_logged = True
+    return True
 
 
 class _DPLRCheckpointPhaseMode(TorchDispatchMode):
@@ -1363,6 +1401,7 @@ def chunk_dplr_delta_rule_tilelang(
         assert output_final_state is False, "Output final state is not supported for CP"
         assert cp_context.cu_seqlens is not None, "cu_seqlens is required for CP"
         cu_seqlens = cp_context.cu_seqlens
+    disable_recompute = _resolve_disable_recompute(disable_recompute, q.device, cp_context)
     if chunk_size is None:
         from fla.ops.generalized_delta_rule.dplr.chunk import gate_bound_is_safe
         chunk_size = 64 if lower_bound is not None and gate_bound_is_safe(lower_bound, 64) else 16
