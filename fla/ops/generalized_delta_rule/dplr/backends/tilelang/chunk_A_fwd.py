@@ -161,34 +161,81 @@ def _chunk_dplr_fwd_intra_tensorcore_kernel_impl(
             T.gemm(a_mat, k_mat_acc, A_ak_frag, transpose_B=True, clear_accum=True)
             T.gemm(a_mat, b_mat_acc, A_ab_frag, transpose_B=True, clear_accum=True)
 
-            # Pairwise fused masked stores: q-side (bf16-gemm fragments) and
-            # a-side (fp32-gemm fragments) stay separate because wgmma assigns
-            # them different fragment layouts.  Aab/Aak are stored fp16
-            # (|Aab| ~<1 from decay; probe shows WY inverse err ~1e-4).
-            for r, c in T.Parallel(BT, BT):
-                t = bos + r
-                if t < eos:
+            if BT >= 64:
+                # Stage the masked A tiles through shared memory: direct
+                # fragment->global stores scatter 2B elements across rows
+                # (IKET: ~35% of CTA time), while the smem round-trip ends
+                # in vectorized bulk copies. Bit-identical: same selects,
+                # same casts. Aab/Aak stay fp16 (see below).
+                A_qk_shared = T.alloc_shared((BT, BT), in_dtype)
+                A_qb_shared = T.alloc_shared((BT, BT), in_dtype)
+                A_ak_shared = T.alloc_shared((BT, BT), "float16")
+                A_ab_shared = T.alloc_shared((BT, BT), "float16")
+                for r, c in T.Parallel(BT, BT):
                     valid_q = (c < valid_len) and (r >= c)
-                    Aqk[t, i_h, c] = T.Cast(
+                    A_qk_shared[r, c] = T.Cast(
                         in_dtype,
                         T.if_then_else(valid_q, A_qk_frag[r, c], T.Cast(acc_dtype, 0.0)),
                     )
-                    Aqb[t, i_h, c] = T.Cast(
+                    A_qb_shared[r, c] = T.Cast(
                         in_dtype,
                         T.if_then_else(valid_q, A_qb_frag[r, c], T.Cast(acc_dtype, 0.0)),
                     )
-            for r, c in T.Parallel(BT, BT):
-                t = bos + r
-                if t < eos:
+                for r, c in T.Parallel(BT, BT):
                     valid_a = (c < valid_len) and (r > c)
-                    Aak[t, i_h, c] = T.Cast(
+                    A_ak_shared[r, c] = T.Cast(
                         "float16",
                         T.if_then_else(valid_a, A_ak_frag[r, c], T.Cast(acc_dtype, 0.0)),
                     )
-                    Aab[t, i_h, c] = T.Cast(
+                    A_ab_shared[r, c] = T.Cast(
                         "float16",
                         T.if_then_else(valid_a, A_ab_frag[r, c], T.Cast(acc_dtype, 0.0)),
                     )
+                if bos + BT <= eos:
+                    T.copy(A_qk_shared, Aqk[bos: bos + BT, i_h, :])
+                    T.copy(A_qb_shared, Aqb[bos: bos + BT, i_h, :])
+                    T.copy(A_ak_shared, Aak[bos: bos + BT, i_h, :])
+                    T.copy(A_ab_shared, Aab[bos: bos + BT, i_h, :])
+                else:
+                    for r, c in T.Parallel(BT, BT):
+                        t = bos + r
+                        if t < eos:
+                            Aqk[t, i_h, c] = A_qk_shared[r, c]
+                            Aqb[t, i_h, c] = A_qb_shared[r, c]
+                    for r, c in T.Parallel(BT, BT):
+                        t = bos + r
+                        if t < eos:
+                            Aak[t, i_h, c] = A_ak_shared[r, c]
+                            Aab[t, i_h, c] = A_ab_shared[r, c]
+            else:
+                # Pairwise fused masked stores: q-side (bf16-gemm fragments) and
+                # a-side (fp32-gemm fragments) stay separate because wgmma assigns
+                # them different fragment layouts.  Aab/Aak are stored fp16
+                # (|Aab| ~<1 from decay; probe shows WY inverse err ~1e-4).
+                for r, c in T.Parallel(BT, BT):
+                    t = bos + r
+                    if t < eos:
+                        valid_q = (c < valid_len) and (r >= c)
+                        Aqk[t, i_h, c] = T.Cast(
+                            in_dtype,
+                            T.if_then_else(valid_q, A_qk_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                        )
+                        Aqb[t, i_h, c] = T.Cast(
+                            in_dtype,
+                            T.if_then_else(valid_q, A_qb_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                        )
+                for r, c in T.Parallel(BT, BT):
+                    t = bos + r
+                    if t < eos:
+                        valid_a = (c < valid_len) and (r > c)
+                        Aak[t, i_h, c] = T.Cast(
+                            "float16",
+                            T.if_then_else(valid_a, A_ak_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                        )
+                        Aab[t, i_h, c] = T.Cast(
+                            "float16",
+                            T.if_then_else(valid_a, A_ab_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                        )
 
     return chunk_dplr_fwd_intra_tensorcore_tl
 
@@ -459,31 +506,48 @@ def _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
             T.gemm(a_mat, k_mat_acc, A_ak_frag, transpose_B=True, clear_accum=True)
             T.gemm(a_mat, b_mat_acc, A_ab_frag, transpose_B=True, clear_accum=True)
 
-            # Pairwise fused masked stores (see chunk_dplr_fwd_intra_tensorcore_tl).
+            # Same smem-staged stores as chunk_dplr_fwd_intra_tensorcore_tl:
+            # direct fragment->global stores scatter 2B elements across rows.
+            A_qk_shared = T.alloc_shared((BT, BT), in_dtype)
+            A_qb_shared = T.alloc_shared((BT, BT), in_dtype)
+            A_ak_shared = T.alloc_shared((BT, BT), "float16")
+            A_ab_shared = T.alloc_shared((BT, BT), "float16")
             for r, c in T.Parallel(BT, BT):
-                t = bos + r
-                if t < eos:
-                    valid_q = (c < valid_len) and (r >= c)
-                    Aqk[t, i_h, c] = T.Cast(
-                        in_dtype,
-                        T.if_then_else(valid_q, A_qk_frag[r, c], T.Cast(acc_dtype, 0.0)),
-                    )
-                    Aqb[t, i_h, c] = T.Cast(
-                        in_dtype,
-                        T.if_then_else(valid_q, A_qb_frag[r, c], T.Cast(acc_dtype, 0.0)),
-                    )
+                valid_q = (c < valid_len) and (r >= c)
+                A_qk_shared[r, c] = T.Cast(
+                    in_dtype,
+                    T.if_then_else(valid_q, A_qk_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                )
+                A_qb_shared[r, c] = T.Cast(
+                    in_dtype,
+                    T.if_then_else(valid_q, A_qb_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                )
             for r, c in T.Parallel(BT, BT):
-                t = bos + r
-                if t < eos:
-                    valid_a = (c < valid_len) and (r > c)
-                    Aak[t, i_h, c] = T.Cast(
-                        "float16",
-                        T.if_then_else(valid_a, A_ak_frag[r, c], T.Cast(acc_dtype, 0.0)),
-                    )
-                    Aab[t, i_h, c] = T.Cast(
-                        "float16",
-                        T.if_then_else(valid_a, A_ab_frag[r, c], T.Cast(acc_dtype, 0.0)),
-                    )
+                valid_a = (c < valid_len) and (r > c)
+                A_ak_shared[r, c] = T.Cast(
+                    "float16",
+                    T.if_then_else(valid_a, A_ak_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                )
+                A_ab_shared[r, c] = T.Cast(
+                    "float16",
+                    T.if_then_else(valid_a, A_ab_frag[r, c], T.Cast(acc_dtype, 0.0)),
+                )
+            if bos + BT <= eos:
+                T.copy(A_qk_shared, Aqk[bos: bos + BT, i_h, :])
+                T.copy(A_qb_shared, Aqb[bos: bos + BT, i_h, :])
+                T.copy(A_ak_shared, Aak[bos: bos + BT, i_h, :])
+                T.copy(A_ab_shared, Aab[bos: bos + BT, i_h, :])
+            else:
+                for r, c in T.Parallel(BT, BT):
+                    t = bos + r
+                    if t < eos:
+                        Aqk[t, i_h, c] = A_qk_shared[r, c]
+                        Aqb[t, i_h, c] = A_qb_shared[r, c]
+                for r, c in T.Parallel(BT, BT):
+                    t = bos + r
+                    if t < eos:
+                        Aak[t, i_h, c] = A_ak_shared[r, c]
+                        Aab[t, i_h, c] = A_ab_shared[r, c]
 
     return chunk_dplr_fwd_intra_from_gk_tl
 
