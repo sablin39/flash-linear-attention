@@ -35,10 +35,16 @@ from fla.utils import get_device_capability
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
 
 
-def _select_a_fwd_threads(major: int, BT: int) -> int:
+def _select_a_fwd_threads(major: int, BT: int, K: int) -> int:
     if BT < 32:
         return 32
-    if major >= 9 and BT >= 64:
+    if major >= 9 and (BT >= 64 or K >= 128):
+        # measured 2026-10-21 (L20D, cc10.3): at K=128 the wider (BT, K) tiles
+        # leave 4 warps with too little latency to hide, and 256 threads buys
+        # -7.1% forward (the A-stage smem is 90112 B at both thread counts, so
+        # residency is unchanged by smem).  At K=64 the opposite holds: 256
+        # threads costs +7.5% because its smaller tiles regress residency
+        # (45056 B, 3 -> 2 CTAs/SM), so the rule stays head-dim dependent.
         return 256
     return 128
 
@@ -317,7 +323,7 @@ def chunk_dplr_fwd_intra(
     ge_f = ge.reshape(N_tokens, H, K).contiguous()
 
     major = get_device_capability(q.device.index)[0] if q.is_cuda else 0
-    threads = _select_a_fwd_threads(major, BT)
+    threads = _select_a_fwd_threads(major, BT, K)
     kernel = _chunk_dplr_fwd_intra_tensorcore_kernel(
         H, K, BT, in_dtype, float(scale), threads=threads,
     )
@@ -584,7 +590,7 @@ def chunk_dplr_fwd_intra_from_gk(
     gk_f = gk.reshape(n_tokens, H, K).contiguous()
 
     major = get_device_capability(q.device.index)[0] if q.is_cuda else 0
-    threads = _select_a_fwd_threads(major, BT)
+    threads = _select_a_fwd_threads(major, BT, K)
     kernel = _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
         H, K, BT, in_dtype, float(scale), float(RCP_LN2),
         threads=threads,

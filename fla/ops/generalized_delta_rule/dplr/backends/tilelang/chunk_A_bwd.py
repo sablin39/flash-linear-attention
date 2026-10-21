@@ -43,11 +43,16 @@ def _a_bwd_config(K: int, BT: int, in_dtype: str, device: torch.device) -> dict[
     # vectorized copies only pay at BT=64 on cc90 (measured flat to -4% at
     # BT<=32; at BT=64 on cc120 the bulk staging exceeds the 99KB smem cap).
     cc = device_cc(device)
-    if cc == 103 and BT >= 64:
-        # cc10.3 has cc90's 228KB optin, and the cc90 shape measures -41%
-        # (D128) / -44% (D64) kernel time vs the BK=32 fallback; BT<=32
-        # is unmeasured there and keeps the fallback.
-        return {"BK": 64, "threads": 256, "bulk_copy": True}
+    if cc == 103:
+        if BT >= 64:
+            # cc10.3 has cc90's 228KB optin, and the cc90 shape measures -41%
+            # (D128) / -44% (D64) kernel time vs the BK=32 fallback.
+            return {"BK": 64, "threads": 256, "bulk_copy": True}
+        # measured 2026-10-21 (L20D, cc10.3): at BT<=32, BK=64 with 128 threads
+        # wins (-1.9..-4.6% fwd+bwd at T=4096, -2.0..-5.1% at T=32k-64k) and the
+        # bulk copies win with it.  The 256-thread variant from the BT=64 set is
+        # what regressed C1b (+9.6% end to end here), not BK or the staging.
+        return {"BK": 64 if K >= 64 else 32, "threads": 128, "bulk_copy": True}
     return {
         "BK": 64 if cc == 90 else 32,
         "threads": 256 if (cc == 90 or BT >= 64) else 128,

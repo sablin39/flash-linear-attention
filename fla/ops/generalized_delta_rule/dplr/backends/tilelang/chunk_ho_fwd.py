@@ -85,6 +85,16 @@ def _ho_fwd_config(K: int, V: int, BT: int, in_dtype: str, device_index: int,
             return {"BV": pick([16, 32, 64]), "threads": 64}
         return {"BV": pick([64, 32, 16]), "threads": 64}
     elif major >= 9 and K <= 128:
+        if major == 10 and V <= 64 and n_seqs is not None and H is not None:
+            # measured 2026-10-21 (L20D, cc10.3): the BV=64 grid is N*H CTAs for
+            # a single V block, so it lands just past a wave boundary at H=40
+            # (160 = 148+12) and quantizes to two full waves.  Halving BV only
+            # pays when that second wave is under half full and there is one V
+            # block to split (at K=V=128 halving BV measured +5.6/+22.6%).
+            sm = get_multiprocessor_count(device_index)
+            grid64 = n_seqs * H * (-(-V // 64))
+            if sm < grid64 < 1.5 * sm:
+                return {"BV": pick([32, 64]), "threads": 256}
         return {"BV": pick([64, 32, 16]), "threads": 256}
     elif major == 8:
         return {"BV": pick([32, 16]), "threads": 128}
