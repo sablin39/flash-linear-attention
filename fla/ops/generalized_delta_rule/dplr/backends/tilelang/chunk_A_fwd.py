@@ -38,13 +38,17 @@ from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_lay
 def _select_a_fwd_threads(major: int, BT: int, K: int) -> int:
     if BT < 32:
         return 32
-    if major >= 9 and (BT >= 64 or K >= 128):
-        # measured 2026-10-21 (L20D, cc10.3): at K=128 the wider (BT, K) tiles
-        # leave 4 warps with too little latency to hide, and 256 threads buys
-        # -7.1% forward (the A-stage smem is 90112 B at both thread counts, so
-        # residency is unchanged by smem).  At K=64 the opposite holds: 256
+    if BT >= 64:
+        return 256
+    if major == 10 and K >= 128:
+        # measured 2026-10-21 (L20D, cc10.3) only: at K=128 the wider (BT, K)
+        # tiles leave 4 warps with too little latency to hide, and 256 threads
+        # buys -7.1% forward (the A-stage smem is 90112 B at both thread counts,
+        # so smem residency is unchanged).  At K=64 the opposite holds: 256
         # threads costs +7.5% because its smaller tiles regress residency
-        # (45056 B, 3 -> 2 CTAs/SM), so the rule stays head-dim dependent.
+        # (45056 B, 3 -> 2 CTAs/SM).  Kept off cc90: that architecture's
+        # BT=32/K=128 A-stage ran 128 threads before this rule existed and has
+        # not been measured at 256.
         return 256
     return 128
 
