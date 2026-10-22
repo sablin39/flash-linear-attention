@@ -57,6 +57,7 @@ def _chunk_dplr_fwd_intra_tensorcore_kernel_impl(
     H, K, BT, in_dtype,
     scale_value: float,
     threads: int = 128,
+    bulk_copy: bool = True,
 ):
     acc_dtype = "float32"
     # fp16 cannot hold the centered exp2 operands (|centered_gi| can reach
@@ -123,6 +124,30 @@ def _chunk_dplr_fwd_intra_tensorcore_kernel_impl(
                 else:
                     gate_offset[c] = 0.0
 
+            # Stage the four raw operands once (bulk on interior chunks, scalar
+            # predicated on tails) and centre them in place below.  The values,
+            # dtypes and casts are unchanged; the wide copies keep more bytes
+            # in flight than the per-element loads (C19).
+            full_tile = (is_valid_chunk and (bos + BT <= eos)) if bulk_copy else False
+            if full_tile:
+                T.copy(q[bos: bos + BT, i_h, 0:K], q_mat)
+                T.copy(k[bos: bos + BT, i_h, 0:K], k_mat)
+                T.copy(b[bos: bos + BT, i_h, 0:K], b_mat)
+                T.copy(a[bos: bos + BT, i_h, 0:K], a_mat)
+            else:
+                for r, c in T.Parallel(BT, K):
+                    t = bos + r
+                    if t < eos:
+                        q_mat[r, c] = T.Cast(qside_dtype, q[t, i_h, c])
+                        k_mat[r, c] = T.Cast(qside_dtype, k[t, i_h, c])
+                        b_mat[r, c] = T.Cast(qside_dtype, b[t, i_h, c])
+                        a_mat[r, c] = T.Cast(acc_dtype, a[t, i_h, c])
+                    else:
+                        q_mat[r, c] = T.Cast(qside_dtype, 0.0)
+                        k_mat[r, c] = T.Cast(qside_dtype, 0.0)
+                        b_mat[r, c] = T.Cast(qside_dtype, 0.0)
+                        a_mat[r, c] = T.Cast(acc_dtype, 0.0)
+
             # Build centered TensorCore operands while keeping the public
             # pre-gated tensors at the validated dtype boundary.
             # Centering follows FLA's tensorcore variant and avoids multiplying
@@ -131,10 +156,10 @@ def _chunk_dplr_fwd_intra_tensorcore_kernel_impl(
             for r, c in T.Parallel(BT, K):
                 t = bos + r
                 if t < eos:
-                    qv = T.Cast(acc_dtype, q[t, i_h, c])
-                    kv = T.Cast(acc_dtype, k[t, i_h, c])
-                    av = T.Cast(acc_dtype, a[t, i_h, c])
-                    bv = T.Cast(acc_dtype, b[t, i_h, c])
+                    qv = T.Cast(acc_dtype, q_mat[r, c])
+                    kv = T.Cast(acc_dtype, k_mat[r, c])
+                    av = T.Cast(acc_dtype, a_mat[r, c])
+                    bv = T.Cast(acc_dtype, b_mat[r, c])
                     giv = gi[t, i_h, c]
                     gev = ge[t, i_h, c]
                     q_scaled = qv * scale_v
@@ -260,8 +285,10 @@ def _chunk_dplr_fwd_intra_tensorcore_kernel_vec(
     H, K, BT, in_dtype,
     scale_value: float,
     threads: int = 128,
+    bulk_copy: bool = True,
 ):
-    return _chunk_dplr_fwd_intra_tensorcore_kernel_impl(H, K, BT, in_dtype, scale_value, threads)
+    return _chunk_dplr_fwd_intra_tensorcore_kernel_impl(
+        H, K, BT, in_dtype, scale_value, threads, bulk_copy=bulk_copy)
 
 
 @tilelang.jit(
@@ -275,21 +302,26 @@ def _chunk_dplr_fwd_intra_tensorcore_kernel_novec(
     H, K, BT, in_dtype,
     scale_value: float,
     threads: int = 128,
+    bulk_copy: bool = True,
 ):
-    return _chunk_dplr_fwd_intra_tensorcore_kernel_impl(H, K, BT, in_dtype, scale_value, threads)
+    return _chunk_dplr_fwd_intra_tensorcore_kernel_impl(
+        H, K, BT, in_dtype, scale_value, threads, bulk_copy=bulk_copy)
 
 
 def _chunk_dplr_fwd_intra_tensorcore_kernel(
     H, K, BT, in_dtype,
     scale_value: float,
     threads: int = 128,
+    bulk_copy: bool = True,
 ):
     # At BT <= 16 the vectorized plan leaves the intra GEMMs without a valid
     # warp partition (M=16 tiles need each warp to own >= 16 rows); compile
     # that shape without vectorization.
     if BT <= 16:
-        return _chunk_dplr_fwd_intra_tensorcore_kernel_novec(H, K, BT, in_dtype, scale_value, threads)
-    return _chunk_dplr_fwd_intra_tensorcore_kernel_vec(H, K, BT, in_dtype, scale_value, threads)
+        return _chunk_dplr_fwd_intra_tensorcore_kernel_novec(
+            H, K, BT, in_dtype, scale_value, threads, bulk_copy=bulk_copy)
+    return _chunk_dplr_fwd_intra_tensorcore_kernel_vec(
+        H, K, BT, in_dtype, scale_value, threads, bulk_copy=bulk_copy)
 
 
 def chunk_dplr_fwd_intra(
@@ -328,8 +360,12 @@ def chunk_dplr_fwd_intra(
 
     major = get_device_capability(q.device.index)[0] if q.is_cuda else 0
     threads = _select_a_fwd_threads(major, BT, K)
+    # Bulk staged loads, as in the from_gk kernel: interior chunks copy the raw
+    # tiles wide instead of per element.  Off at BT>=64, whose fp32 gate tiles
+    # already sit at the smem cap.
+    bulk_copy = BT <= 32
     kernel = _chunk_dplr_fwd_intra_tensorcore_kernel(
-        H, K, BT, in_dtype, float(scale), threads=threads,
+        H, K, BT, in_dtype, float(scale), threads=threads, bulk_copy=bulk_copy,
     )
 
     qg_f = torch.empty((N_tokens, H, K), dtype=q.dtype, device=q.device)
@@ -369,6 +405,7 @@ def _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
     cumsum_scale_value: float,
     threads: int = 128,
     gk_dtype: str | None = None,
+    bulk_copy: bool = True,
 ):
     """A-stage with the chunk-local gi cumsum computed inside the CTA."""
     acc_dtype = "float32"
@@ -428,18 +465,22 @@ def _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
             scale_v = T.Cast(acc_dtype, scale_value)
             cumsum_scale = T.Cast(acc_dtype, cumsum_scale_value)
 
-            # hoist the gk tile into shared for the serial scan; the gating
-            # loop below re-reads gk from global (L2-resident by then), which
-            # ends this tile's lifetime at the scan and lets the allocator
-            # overlap it with the fp32 operand tiles — needed to stay under
-            # the smem cap at BT=64 with fp32 gates
+            # Interior chunks stage the five raw tiles with bulk copies and
+            # centre them in place; the scalar predicated path handles tails.
+            # The per-element loads kept only ~0.9 KiB per warp in flight, and
+            # the A-stage is bandwidth-starved at 4 CTAs/SM
+            # (artifacts/diagnosis_a_stage.md).
+            full_tile = (is_valid_chunk and (bos + BT <= eos)) if bulk_copy else False
             gk_shared = T.alloc_shared((BT, K), gk_dtype)
-            for r, c in T.Parallel(BT, K):
-                t = bos + r
-                if t < eos:
-                    gk_shared[r, c] = gk[t, i_h, c]
-                else:
-                    gk_shared[r, c] = T.Cast(gk_dtype, 0.0)
+            if full_tile:
+                T.copy(gk[bos: bos + BT, i_h, 0:K], gk_shared)
+            else:
+                for r, c in T.Parallel(BT, K):
+                    t = bos + r
+                    if t < eos:
+                        gk_shared[r, c] = gk[t, i_h, c]
+                    else:
+                        gk_shared[r, c] = T.Cast(gk_dtype, 0.0)
 
             for c in T.Parallel(K):
                 prefix_acc[c] = T.Cast(acc_dtype, 0.0)
@@ -472,14 +513,37 @@ def _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
                 else:
                     gate_offset[c] = T.Cast(acc_dtype, 0.0)
 
+            # Stage the four raw operands once (bulk on interior chunks, scalar
+            # predicated on tails), then centre them in place below.  The raw
+            # tiles are exactly what the per-element loads used to read, so
+            # every product and cast is unchanged.
+            if full_tile:
+                T.copy(q[bos: bos + BT, i_h, 0:K], q_mat)
+                T.copy(k[bos: bos + BT, i_h, 0:K], k_mat)
+                T.copy(b[bos: bos + BT, i_h, 0:K], b_mat)
+                T.copy(a[bos: bos + BT, i_h, 0:K], a_mat)
+            else:
+                for r, c in T.Parallel(BT, K):
+                    t = bos + r
+                    if t < eos:
+                        q_mat[r, c] = T.Cast(qside_dtype, q[t, i_h, c])
+                        k_mat[r, c] = T.Cast(qside_dtype, k[t, i_h, c])
+                        b_mat[r, c] = T.Cast(qside_dtype, b[t, i_h, c])
+                        a_mat[r, c] = T.Cast(acc_dtype, a[t, i_h, c])
+                    else:
+                        q_mat[r, c] = T.Cast(qside_dtype, 0.0)
+                        k_mat[r, c] = T.Cast(qside_dtype, 0.0)
+                        b_mat[r, c] = T.Cast(qside_dtype, 0.0)
+                        a_mat[r, c] = T.Cast(acc_dtype, 0.0)
+
             for r, c in T.Parallel(BT, K):
                 t = bos + r
                 if t < eos:
-                    qv = T.Cast(acc_dtype, q[t, i_h, c])
-                    kv = T.Cast(acc_dtype, k[t, i_h, c])
-                    av = T.Cast(acc_dtype, a[t, i_h, c])
-                    bv = T.Cast(acc_dtype, b[t, i_h, c])
-                    gkv = T.Cast(acc_dtype, gk[t, i_h, c])
+                    qv = T.Cast(acc_dtype, q_mat[r, c])
+                    kv = T.Cast(acc_dtype, k_mat[r, c])
+                    av = T.Cast(acc_dtype, a_mat[r, c])
+                    bv = T.Cast(acc_dtype, b_mat[r, c])
+                    gkv = T.Cast(acc_dtype, gk_shared[r, c])
                     giv = gi_mat[r, c]
                     gev = giv - gkv * cumsum_scale
                     q_scaled = qv * scale_v
@@ -595,10 +659,15 @@ def chunk_dplr_fwd_intra_from_gk(
 
     major = get_device_capability(q.device.index)[0] if q.is_cuda else 0
     threads = _select_a_fwd_threads(major, BT, K)
+    # Bulk staged loads: interior chunks copy the raw tiles with wide copies
+    # instead of per-element predicated loads.  Off at BT>=64, whose fp32 gate
+    # tiles already sit at the smem cap (see the gk_shared comment above).
+    bulk_copy = BT <= 32
     kernel = _chunk_dplr_fwd_intra_from_gk_tensorcore_kernel(
         H, K, BT, in_dtype, float(scale), float(RCP_LN2),
         threads=threads,
         gk_dtype=str(gk.dtype).split(".")[-1],
+        bulk_copy=bulk_copy,
     )
     qg_f = torch.empty((n_tokens, H, K), dtype=q.dtype, device=q.device)
     kg_f = torch.empty((n_tokens, H, K), dtype=q.dtype, device=q.device)
