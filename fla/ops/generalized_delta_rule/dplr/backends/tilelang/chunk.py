@@ -24,7 +24,6 @@ from fla.utils import get_device_capability
 from .chunk_A_bwd import (
     chunk_dplr_bwd_dqk_intra_fused_qside_into,
 )
-from .schedules import default_chunk_size, device_cc
 from .chunk_A_fwd import (
     chunk_dplr_fwd_intra,
     chunk_dplr_fwd_intra_from_gk,
@@ -39,6 +38,7 @@ from .chunk_stream_bwd_twopass import (
 )
 from .cumsum import chunk_local_cumsum
 from .layout import ChunkLayout, build_varlen_chunk_layout
+from .schedules import default_chunk_size, device_cc
 from .wy_fast_bwd import chunk_dplr_bwd_wy_repr_into
 from .wy_fast_fwd import prepare_wy_repr_fwd
 
