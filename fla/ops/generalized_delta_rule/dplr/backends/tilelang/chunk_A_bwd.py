@@ -32,7 +32,7 @@ import torch
 from fla.ops.utils.constant import RCP_LN2
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
-from .schedules import device_cc
+from .schedules import arch_tuning, device_cc
 
 
 def _a_bwd_config(K: int, BT: int, in_dtype: str, device: torch.device) -> dict[str, int]:
@@ -43,7 +43,7 @@ def _a_bwd_config(K: int, BT: int, in_dtype: str, device: torch.device) -> dict[
     # vectorized copies only pay at BT=64 on cc90 (measured flat to -4% at
     # BT<=32; at BT=64 on cc120 the bulk staging exceeds the 99KB smem cap).
     cc = device_cc(device)
-    if cc == 103:
+    if arch_tuning(cc).get("bulk_cfg"):
         if BT >= 64:
             # cc10.3 has cc90's 228KB optin, and the cc90 shape measures -41%
             # (D128) / -44% (D64) kernel time vs the BK=32 fallback.

@@ -33,23 +33,23 @@ from fla.ops.utils.constant import RCP_LN2
 from fla.utils import get_device_capability
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
+from .schedules import arch_tuning
 
 
-def _select_a_fwd_threads(major: int, BT: int, K: int) -> int:
+def _select_a_fwd_threads(cc: int, BT: int, K: int) -> int:
     if BT < 32:
         return 32
     if BT >= 64:
         return 256
-    if major == 10 and K >= 128:
-        # measured 2026-10-21 (L20D, cc10.3) only: at K=128 the wider (BT, K)
+    if K >= 128:
+        # measured 2026-10-21 on sm103 (cc10.3): at K=128 the wider (BT, K)
         # tiles leave 4 warps with too little latency to hide, and 256 threads
         # buys -7.1% forward (the A-stage smem is 90112 B at both thread counts,
         # so smem residency is unchanged).  At K=64 the opposite holds: 256
         # threads costs +7.5% because its smaller tiles regress residency
-        # (45056 B, 3 -> 2 CTAs/SM).  Kept off cc90: that architecture's
-        # BT=32/K=128 A-stage ran 128 threads before this rule existed and has
-        # not been measured at 256.
-        return 256
+        # (45056 B, 3 -> 2 CTAs/SM).  The tuning table decides which parts
+        # take the 256-thread schedule.
+        return arch_tuning(cc).get("a_fwd_k128_threads", 128)
     return 128
 
 
@@ -358,8 +358,8 @@ def chunk_dplr_fwd_intra(
     gi_f = gi.reshape(N_tokens, H, K).contiguous()
     ge_f = ge.reshape(N_tokens, H, K).contiguous()
 
-    major = get_device_capability(q.device.index)[0] if q.is_cuda else 0
-    threads = _select_a_fwd_threads(major, BT, K)
+    cap = get_device_capability(q.device.index) if q.is_cuda else (0, 0)
+    threads = _select_a_fwd_threads(cap[0] * 10 + cap[1], BT, K)
     # Bulk staged loads, as in the from_gk kernel: interior chunks copy the raw
     # tiles wide instead of per element.  Off at BT>=64, whose fp32 gate tiles
     # already sit at the smem cap.
@@ -657,8 +657,8 @@ def chunk_dplr_fwd_intra_from_gk(
     b_f = b.reshape(n_tokens, H, K).contiguous()
     gk_f = gk.reshape(n_tokens, H, K).contiguous()
 
-    major = get_device_capability(q.device.index)[0] if q.is_cuda else 0
-    threads = _select_a_fwd_threads(major, BT, K)
+    cap = get_device_capability(q.device.index) if q.is_cuda else (0, 0)
+    threads = _select_a_fwd_threads(cap[0] * 10 + cap[1], BT, K)
     # Bulk staged loads: interior chunks copy the raw tiles with wide copies
     # instead of per-element predicated loads.  Off at BT>=64, whose fp32 gate
     # tiles already sit at the smem cap (see the gk_shared comment above).

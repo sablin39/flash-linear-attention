@@ -26,7 +26,7 @@ import tilelang.language as T
 import torch
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
-from .schedules import device_cc
+from .schedules import arch_tuning, device_cc
 
 
 def _wu_fwd_config(BT: int, K: int, device: torch.device) -> dict[str, int]:
@@ -39,7 +39,7 @@ def _wu_fwd_config(BT: int, K: int, device: torch.device) -> dict[str, int]:
     if BT <= 16:
         return {"threads": 32, "bulk_copy": False}
     cc = device_cc(device)
-    if cc == 103:
+    if arch_tuning(cc).get("bulk_cfg"):
         # measured 2026-10-21 (L20D, cc10.3): the BT=64 config is also the
         # right one at BT<=32 - wu_fwd -46%, and the same change in
         # wy_fast_bwd -43% - so the BT gate was only ever a proxy for

@@ -28,7 +28,7 @@ import tilelang.language as T
 import torch
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
-from .schedules import device_cc
+from .schedules import arch_tuning, device_cc
 
 
 def _wy_bwd_config(BT: int, device: torch.device) -> dict[str, int]:
@@ -39,7 +39,7 @@ def _wy_bwd_config(BT: int, device: torch.device) -> dict[str, int]:
     if BT <= 16:
         return {"threads": 32, "bulk_copy": False}
     cc = device_cc(device)
-    if cc == 103:
+    if arch_tuning(cc).get("bulk_cfg"):
         # measured 2026-10-21 (L20D, cc10.3): -43% kernel time at BT=32 too, so
         # the BT gate was only a proxy for the device's smem optin.
         # bulk copies win on cc10.3 too, but with 128 threads: -52% (D128)

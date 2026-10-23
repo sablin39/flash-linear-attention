@@ -1009,3 +1009,45 @@ def test_chunk_tilelang_checkpoint_elision(monkeypatch):
     assert elided_calls, 'checkpoint forward did not take the ctx-elided route'
     for name, r, t in zip(('o', 'ht', 'dq', 'dk', 'dv', 'da', 'db', 'dgk', 'dh0'), ref, tri):
         assert_close(name, r, t, 0.01)
+
+
+def test_default_chunk_size_by_arch():
+    from fla.ops.generalized_delta_rule.dplr.backends.tilelang.schedules import default_chunk_size
+
+    # 64 whenever the declared bound licenses it, on any architecture
+    assert default_chunk_size(-0.61, 90) == 64
+    assert default_chunk_size(-2.6, 120) == 64
+    # the measured sm103/sm100 rows prefer cs32 when 64 is not licensed
+    assert default_chunk_size(-5.0, 103) == 32
+    assert default_chunk_size(-5.0, 100) == 32
+    # unmeasured architectures keep the Triton default, and no bound means 16
+    assert default_chunk_size(-5.0, 90) == 16
+    assert default_chunk_size(-5.0, 101) == 16
+    assert default_chunk_size(-5.0, 110) == 16
+    assert default_chunk_size(None, 103) == 16
+    # a bound too large for cs32 falls through to 16 (and the verifier rejects it)
+    assert default_chunk_size(-10.0, 103) == 16
+    assert not gate_bound_is_safe(-10.0, 16)
+
+
+@requires_tilelang_route
+def test_chunk_tilelang_entry_requires_licensed_bound():
+    from fla.ops.generalized_delta_rule.dplr.backends.tilelang.chunk import (
+        chunk_dplr_delta_rule_tilelang,
+    )
+
+    torch.manual_seed(0)
+    B, T, H, D = 1, 128, 8, 64
+    q = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    a = F.normalize(torch.rand(B, T, H, D, device=device), p=2, dim=-1).to(torch.bfloat16)
+    b = -a
+    gk = F.logsigmoid(torch.randn(B, T, H, D, device=device)).to(torch.bfloat16).clamp(-5, 0)
+
+    with pytest.raises(ValueError, match='safe_gate=True or a lower_bound'):
+        chunk_dplr_delta_rule_tilelang(
+            q=q, k=k, v=v, a=a, b=b, gk=gk, scale=1.0, chunk_size=32)
+    with pytest.raises(ValueError, match='chunk_size=64, bound=-5.0'):
+        chunk_dplr_delta_rule_tilelang(
+            q=q, k=k, v=v, a=a, b=b, gk=gk, scale=1.0, safe_gate=True, chunk_size=64)

@@ -28,17 +28,16 @@ import torch
 from fla.utils import get_device_capability, get_device_smem_optin, get_multiprocessor_count
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
-from .schedules import dtype_nbytes
+from .schedules import arch_tuning, dtype_nbytes
 
 
 def _chunk_h_fwd_config(K: int, V: int, device_index: int, n_seqs: int = 1, H: int = 1) -> dict[str, int]:
-    cap_major = get_device_capability(device_index)[0]
-    if cap_major == 9 and K <= 128:
-        return {"BV": 64 if V >= 64 else 32 if V >= 32 else 16, "threads": 256}
-    elif cap_major == 10 and K <= 128:
-        # measured on cc10.3 (L20D): the cc9 tile shape is bit-exact vs the
-        # generic fallback and 15-32% faster across BT 16/32/64
-        if V >= 64 and -(V // -64) * n_seqs * H * 2 <= get_multiprocessor_count(device_index):
+    cap_major, cap_minor = get_device_capability(device_index)
+    tuning = arch_tuning(cap_major * 10 + cap_minor)
+    if tuning.get("h_base") and K <= 128:
+        # measured on sm103 (cc10.3) for both rows: the measured tile shape is
+        # bit-exact vs the generic fallback and 15-32% faster across BT 16/32/64
+        if tuning.get("h_split") and V >= 64 and -(V // -64) * n_seqs * H * 2 <= get_multiprocessor_count(device_index):
             # BV 32 doubles the CTA count, but each CTA re-loads the kg/w/gk
             # operand tiles per V-block, so it only pays when the BV 64 grid
             # fills at most half the SMs (-19% h-fwd on 64-CTA rect grids,
@@ -433,9 +432,10 @@ def chunk_dplr_fwd_h(
     # BT=64 chunk in one H recurrence sub-block. Splitting into two BC=32
     # halves changes the fp32 accumulation order and was enough to create rare
     # one-ULP bf16 output spikes at long varlen sequence lengths.
-    cap_major = get_device_capability(kg.device.index)[0]
-    if cap_major in (9, 10):
-        # cc10.3 (L20D) also measures 41-49% faster with the unsplit
+    cap_major, cap_minor = get_device_capability(kg.device.index)
+    tuning = arch_tuning(cap_major * 10 + cap_minor)
+    if tuning.get("h_base"):
+        # sm103 (cc10.3) also measures 41-49% faster with the unsplit
         # sub-block; the accumulation reorder is within suite tolerance
         BC = min(BT, 64 if K <= 128 else 32)
     elif cap_major == 8:
@@ -470,15 +470,22 @@ def chunk_dplr_fwd_h(
     # it is bit-identical to the unpipelined schedule, and BT >= 64 for
     # now; the tuned small-chunk paths keep their validated schedule.
     # sm90 must stage the bg product through smem (see the kernel body);
-    # cc10 lowers the direct accumulation and measures ~5% faster fwd.
+    # sm100/sm103 lower the direct accumulation and measure ~5% faster fwd.
     stage_bg = cap_major == 9
     pipelined = (
         BC == BT
         and BT >= 64
-        and cap_major in (9, 10)
+        and tuning.get("h_base")
         and _chunk_h_smem_bytes(BT, K, config["BV"], in_dtype, pipelined=True, stage_bg=stage_bg)
         <= get_device_smem_optin(kg.device.index)
     )
+    # Safety check for the variant actually launched: the unpipelined schedule
+    # is never gated above and must fit the device's opt-in as well.
+    footprint = _chunk_h_smem_bytes(
+        BT, K, config["BV"], in_dtype, pipelined=pipelined, stage_bg=stage_bg)
+    optin = get_device_smem_optin(kg.device.index)
+    if footprint > optin:
+        raise RuntimeError(f"chunk-h needs {footprint}B, device allows {optin}B")
     kernel = _chunk_dplr_fwd_h_kernel(
         H, K, V, BT, BC,
         in_dtype, state_dtype, use_h0, store_ht,

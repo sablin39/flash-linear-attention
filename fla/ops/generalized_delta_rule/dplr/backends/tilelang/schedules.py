@@ -24,6 +24,36 @@ def device_cc(device: torch.device) -> int:
     return major * 10 + minor
 
 
+# Per-capability schedule extras measured for this backend; unmeasured parts
+# get {}.  Keys: h_base (chunk-h large tile / full BC / pipelined walk),
+# h_split (BV split on under-filled grids), a_fwd_k128_threads, ho_tuned,
+# bulk_cfg (WY fwd/bwd + fused A-bwd bulk configs), chunk32_default.
+_BLACKWELL = dict(a_fwd_k128_threads=256, h_split=True, ho_tuned=True,
+                  bulk_cfg=True, chunk32_default=True)
+ARCH_TUNING = {
+    90: dict(h_base=True),
+    100: dict(h_base=True, **_BLACKWELL),   # sm100 shares the measured sm103 row
+    103: dict(h_base=True, **_BLACKWELL),
+}
+
+
+def arch_tuning(cc: int | None) -> dict:
+    return ARCH_TUNING.get(cc, {})
+
+
+def default_chunk_size(bound: float | None, cc: int | None = None) -> int:
+    """Chunk size when the caller names none: 64 if licensed, else the
+    measured cs32 regime on parts that prefer it, else 16."""
+    from fla.ops.generalized_delta_rule.dplr.chunk import gate_bound_is_safe
+    if bound is None:
+        return 16
+    if gate_bound_is_safe(bound, 64):
+        return 64
+    if arch_tuning(cc).get("chunk32_default") and gate_bound_is_safe(bound, 32):
+        return 32
+    return 16
+
+
 # Compiler-reported dynamic shared memory of the fused A-backward kernel
 # (chunk_dplr_bwd_intra_tl, FUSE_QSIDE_DA=True) at BT=64 with the BK=32
 # config used off cc90. All of its shared tiles are (BT, BK), (BT, BT) or

@@ -26,7 +26,7 @@ import torch
 from fla.utils import get_device_capability, get_device_smem_optin, get_multiprocessor_count
 
 from .layout import ChunkLayout, build_rect_chunk_layout, build_varlen_chunk_layout
-from .schedules import dtype_nbytes
+from .schedules import arch_tuning, dtype_nbytes
 
 
 def _ho_smem_bytes(BT: int, K: int, BV: int, in_dtype: str, num_stages: int = 1) -> int:
@@ -56,11 +56,21 @@ def _ho_fwd_num_stages(BT: int, K: int, BV: int, in_dtype: str, device_index: in
     return 0
 
 
+def _check_ho_smem(BT: int, K: int, in_dtype: str, config: dict[str, int],
+                   device_index: int) -> None:
+    stages = 2 if config.get("num_stages", 0) >= 2 else 1
+    need = _ho_smem_bytes(BT, K, config["BV"], in_dtype, stages)
+    if need > get_device_smem_optin(device_index):
+        raise RuntimeError(
+            f"fused h+o needs {need}B, device allows {get_device_smem_optin(device_index)}B")
+
+
 def _ho_fwd_config(K: int, V: int, BT: int, in_dtype: str, device_index: int,
                    n_seqs: int | None = None, H: int | None = None) -> dict[str, int]:
     if not torch.cuda.is_available():
         return {"BV": 16, "threads": 64}
-    major = get_device_capability(device_index)[0]
+    major, minor = get_device_capability(device_index)
+    tuning = arch_tuning(major * 10 + minor)
     smem_limit = get_device_smem_optin(device_index)
 
     def pick(candidates: list[int]) -> int:
@@ -72,8 +82,8 @@ def _ho_fwd_config(K: int, V: int, BT: int, in_dtype: str, device_index: int,
     if BT <= 16:
         # 16-row GEMMs only partition across <= 2 warps (m_warp x n_warp must
         # equal num_warps with >= 16 rows and >= 8 cols per warp).
-        if major == 10:
-            # measured on cc10.3 (L20D): the serial chunk chain is
+        if tuning.get("ho_tuned"):
+            # measured on sm103 (cc10.3): the serial chunk chain is
             # occupancy-bound at (V/BV)xNxH blocks, so BV=16 quadruples the
             # block count and wins 23% on small grids; K=64 grids that
             # already fill the device prefer BV=64 (fewer redundant operand
@@ -85,12 +95,13 @@ def _ho_fwd_config(K: int, V: int, BT: int, in_dtype: str, device_index: int,
             return {"BV": pick([16, 32, 64]), "threads": 64}
         return {"BV": pick([64, 32, 16]), "threads": 64}
     elif major >= 9 and K <= 128:
-        if major == 10 and V <= 64 and n_seqs is not None and H is not None:
-            # measured 2026-10-21 (L20D, cc10.3): the BV=64 grid is N*H CTAs for
-            # a single V block, so it lands just past a wave boundary at H=40
-            # (160 = 148+12) and quantizes to two full waves.  Halving BV only
-            # pays when that second wave is under half full and there is one V
-            # block to split (at K=V=128 halving BV measured +5.6/+22.6%).
+        if tuning.get("ho_tuned") and V <= 64 and n_seqs is not None and H is not None:
+            # measured 2026-10-21 on sm103 (cc10.3): the BV=64 grid is N*H
+            # CTAs for a single V block, so it lands just past a wave boundary
+            # at H=40 (160 = 148+12) and quantizes to two full waves.  Halving
+            # BV only pays when that second wave is under half full and there
+            # is one V block to split (at K=V=128 halving BV measured
+            # +5.6/+22.6%).
             sm = get_multiprocessor_count(device_index)
             grid64 = n_seqs * H * (-(-V // 64))
             if sm < grid64 < 1.5 * sm:
@@ -497,6 +508,7 @@ def chunk_dplr_fwd_ho(
         device_index=kg.device.index,
     )
     config["num_stages"] = _ho_fwd_num_stages(chunk_size, K, config["BV"], in_dtype, kg.device.index)
+    _check_ho_smem(chunk_size, K, in_dtype, config, kg.device.index)
     kernel = _chunk_dplr_fwd_ho_kernel(
         H, K, V, chunk_size,
         in_dtype, "float32", initial_state is not None, output_final_state,
@@ -554,6 +566,7 @@ def chunk_dplr_fwd_ho_ctx(
         device_index=kg.device.index,
     )
     config["num_stages"] = _ho_fwd_num_stages(chunk_size, K, config["BV"], in_dtype, kg.device.index)
+    _check_ho_smem(chunk_size, K, in_dtype, config, kg.device.index)
     kernel = _chunk_dplr_fwd_ho_kernel(
         H, K, V, chunk_size,
         in_dtype, "float32", initial_state is not None, output_final_state,

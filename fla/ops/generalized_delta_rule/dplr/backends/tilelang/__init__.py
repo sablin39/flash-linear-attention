@@ -16,7 +16,12 @@ import torch
 from fla.backends import TileLangBackend, register
 from fla.utils import get_device_capability, get_device_smem_optin, get_multiprocessor_count
 
-from .schedules import chunk64_schedule_or_none, stream_bwd_schedule_or_none
+from .schedules import (
+    chunk64_schedule_or_none,
+    default_chunk_size,
+    device_cc,
+    stream_bwd_schedule_or_none,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +43,8 @@ class DPLRTileLangBackend(TileLangBackend):
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
-        cu_seqlens_cpu: torch.LongTensor | None = None,
         safe_gate: bool = False,
         chunk_size: int | None = None,
-        disable_recompute: bool = False,
         cp_context=None,
         lower_bound: float | None = None,
         **kwargs,
@@ -74,11 +77,12 @@ class DPLRTileLangBackend(TileLangBackend):
         if k.shape[-1] not in (64, 128):
             return False, f"TileLang backend supports head dim 64 or 128 (got {k.shape[-1]}); fall back to Triton"
         from fla.ops.generalized_delta_rule.dplr.chunk import gate_bound_is_safe
+        bound = lower_bound if lower_bound is not None else (-5.0 if safe_gate else None)
         if chunk_size is None:
-            chunk_size = 64 if lower_bound is not None and gate_bound_is_safe(lower_bound, 64) else 16
+            chunk_size = default_chunk_size(
+                bound, device_cc(q.device) if q.is_cuda else None)
         if chunk_size not in (16, 32, 64):
             return False, f"TileLang backend supports chunk_size 16/32/64, got {chunk_size}; fall back to Triton"
-        bound = lower_bound if lower_bound is not None else (-5.0 if safe_gate else None)
         if bound is None or not gate_bound_is_safe(bound, chunk_size):
             return False, (
                 "TileLang backend requires safe_gate or a lower_bound that fits "
@@ -194,20 +198,21 @@ class DPLRTileLangBackend(TileLangBackend):
         from fla.ops.generalized_delta_rule.dplr.backends.tilelang.chunk import (
             chunk_dplr_delta_rule_tilelang,
         )
+        call = dict(
+            q=q, k=k, v=v, a=a, b=b, gk=gk,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            chunk_size=chunk_size,
+            disable_recompute=disable_recompute,
+            cp_context=cp_context,
+        )
         try:
-            return chunk_dplr_delta_rule_tilelang(
-                q=q, k=k, v=v, a=a, b=b, gk=gk,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_cpu=cu_seqlens_cpu,
-                safe_gate=safe_gate,
-                lower_bound=lower_bound,
-                chunk_size=chunk_size,
-                disable_recompute=disable_recompute,
-                cp_context=cp_context,
-            )
+            return chunk_dplr_delta_rule_tilelang(**call)
         except Exception as exc:
             # The verifier gates on the schedule arithmetic, but JIT/launch
             # failures can still escape; honor the dispatch contract and fall
@@ -227,16 +232,4 @@ class DPLRTileLangBackend(TileLangBackend):
             fn = dplr_chunk.chunk_dplr_delta_rule
             while hasattr(fn, "__wrapped__"):
                 fn = fn.__wrapped__
-            return fn(
-                q=q, k=k, v=v, a=a, b=b, gk=gk,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_cpu=cu_seqlens_cpu,
-                safe_gate=safe_gate,
-                lower_bound=lower_bound,
-                chunk_size=chunk_size,
-                disable_recompute=disable_recompute,
-                cp_context=cp_context,
-            )
+            return fn(**call)

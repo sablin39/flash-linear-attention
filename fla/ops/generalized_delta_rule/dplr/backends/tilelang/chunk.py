@@ -24,6 +24,7 @@ from fla.utils import get_device_capability
 from .chunk_A_bwd import (
     chunk_dplr_bwd_dqk_intra_fused_qside_into,
 )
+from .schedules import default_chunk_size, device_cc
 from .chunk_A_fwd import (
     chunk_dplr_fwd_intra,
     chunk_dplr_fwd_intra_from_gk,
@@ -1441,7 +1442,7 @@ def chunk_dplr_delta_rule_tilelang(
     cp_context=None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    del cu_seqlens_cpu, safe_gate
+    del cu_seqlens_cpu
     if "head_first" in kwargs:
         raise DeprecationWarning(
             "head_first has been removed; inputs must use [B, T, H, ...]"
@@ -1453,9 +1454,18 @@ def chunk_dplr_delta_rule_tilelang(
         assert output_final_state is False, "Output final state is not supported for CP"
         assert cp_context.cu_seqlens is not None, "cu_seqlens is required for CP"
         cu_seqlens = cp_context.cu_seqlens
+    # Direct callers bypass the verifier: require a licensed bound and a
+    # supported chunk before launching the centered tensor-core kernels.
+    bound = lower_bound if lower_bound is not None else (-5.0 if safe_gate else None)
     if chunk_size is None:
-        from fla.ops.generalized_delta_rule.dplr.chunk import gate_bound_is_safe
-        chunk_size = 64 if lower_bound is not None and gate_bound_is_safe(lower_bound, 64) else 16
+        chunk_size = default_chunk_size(bound, device_cc(q.device) if q.is_cuda else None)
+    from fla.ops.generalized_delta_rule.dplr.chunk import gate_bound_is_safe
+    if (bound is None or chunk_size not in (16, 32, 64)
+            or not gate_bound_is_safe(bound, chunk_size)):
+        raise ValueError(
+            f"TileLang DPLR needs safe_gate=True or a lower_bound, and a chunk_size "
+            f"whose centered operands stay in fp32 range; got chunk_size={chunk_size}, "
+            f"bound={bound}")
     scale_f = float(q.shape[-1] ** -0.5 if scale is None else scale)
     n_seqs = len(cu_seqlens) - 1 if cu_seqlens is not None else q.shape[0]
     if initial_state is not None:
