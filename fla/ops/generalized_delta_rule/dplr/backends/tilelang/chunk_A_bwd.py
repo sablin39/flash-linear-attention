@@ -79,6 +79,18 @@ def _chunk_dplr_bwd_kernel_intra(
     gk_dtype: str | None = None,
 ):
     acc_dtype = "float32"
+    # The eight dA GEMMs are the only dots left in this kernel that the
+    # hardware would run in tf32, whose 10-bit mantissa is what makes the
+    # safe-gate gradient drift with context.  Their operands are a gate-scaled
+    # fp32 tile and a dA tile that is bf16-exact anyway (recomputed through
+    # bf16, or loaded from bf16 globals), so staging dA as bf16 and splitting
+    # the gate-scaled operand into hi/lo bf16 terms evaluates the same product
+    # with ~2^-16 operand resolution: two bf16 MMAs (k=16 each) price like one
+    # tf32 MMA (k=8) in issued instructions.
+    # fp16 cannot: its 5-bit exponent overflows on exp2(-(gi - offset)) and the
+    # hi/lo pair then evaluates inf - inf, so fp16 keeps the tf32 dots.
+    split_dots = in_dtype == "bfloat16"
+    dA_dtype = in_dtype if split_dots else acc_dtype
     # DERIVE_GE loads raw gk, which may stay in its own dtype (e.g. fp32)
     ge_in_dtype = (gk_dtype or in_dtype) if DERIVE_GE else acc_dtype
     n_tokens, n_seq_plus_one, n_chunks, n_tokens_d = T.dynamic(
@@ -144,8 +156,14 @@ def _chunk_dplr_bwd_kernel_intra(
             # the four-tile layout), and the footprint drops by 2*(BT,BT)
             # fp32 tiles — what makes the fused A-backward fit a 99KB cap at
             # BT=64.
-            dA1_shared = T.alloc_shared((BT, BT), acc_dtype)
-            dA2_shared = T.alloc_shared((BT, BT), acc_dtype)
+            dA1_shared = T.alloc_shared((BT, BT), dA_dtype)
+            dA2_shared = T.alloc_shared((BT, BT), dA_dtype)
+            if split_dots:
+                # Reused for each gate-scaled operand in turn (k, b, q, a):
+                # written between two GEMM groups, so the extra footprint is
+                # one (BT, BK) bf16 pair rather than one per operand.
+                op_hi = T.alloc_shared((BT, BK), in_dtype)
+                op_lo = T.alloc_shared((BT, BK), in_dtype)
             if FUSE_QSIDE_DA:
                 do_shared = T.alloc_shared((BT, BV), in_dtype)
                 v_shared = T.alloc_shared((BT, BV), in_dtype)
@@ -236,31 +254,31 @@ def _chunk_dplr_bwd_kernel_intra(
                         # keeps dAqk/dAqb in fp32 and can create one-ULP
                         # dq/dk spikes versus the default FLA/saved envelope.
                         dA1_shared[r, c] = T.Cast(
-                            acc_dtype,
+                            dA_dtype,
                             T.Cast(in_dtype, dAqk_frag[r, c] * T.Cast(acc_dtype, scale_value)),
                         )
                         dA2_shared[r, c] = T.Cast(
-                            acc_dtype,
+                            dA_dtype,
                             T.Cast(in_dtype, dAqb_frag[r, c] * T.Cast(acc_dtype, scale_value)),
                         )
                     else:
-                        dA1_shared[r, c] = T.float32(0.0)
-                        dA2_shared[r, c] = T.float32(0.0)
+                        dA1_shared[r, c] = T.Cast(dA_dtype, 0.0)
+                        dA2_shared[r, c] = T.Cast(dA_dtype, 0.0)
             else:
                 for r, c in T.Parallel(BT, BT):
                     t = bos + r
                     if t < eos:
-                        dA1_shared[r, c] = T.Cast(acc_dtype, dAqk[t, i_h, c])
-                        dA2_shared[r, c] = T.Cast(acc_dtype, dAqb[t, i_h, c])
+                        dA1_shared[r, c] = T.Cast(dA_dtype, dAqk[t, i_h, c])
+                        dA2_shared[r, c] = T.Cast(dA_dtype, dAqb[t, i_h, c])
                     else:
-                        dA1_shared[r, c] = T.float32(0.0)
-                        dA2_shared[r, c] = T.float32(0.0)
+                        dA1_shared[r, c] = T.Cast(dA_dtype, 0.0)
+                        dA2_shared[r, c] = T.Cast(dA_dtype, 0.0)
 
             # q-side causal mask: keep the inclusive lower triangle
             for r, c in T.Parallel(BT, BT):
                 if r < c:
-                    dA1_shared[r, c] = T.float32(0.0)
-                    dA2_shared[r, c] = T.float32(0.0)
+                    dA1_shared[r, c] = T.Cast(dA_dtype, 0.0)
+                    dA2_shared[r, c] = T.Cast(dA_dtype, 0.0)
 
             # Compute stabilization offset from gi at mid-point of valid tokens
             valid_len = T.min(eos - bos, BT)
@@ -292,10 +310,32 @@ def _chunk_dplr_bwd_kernel_intra(
 
             # q-side group: dq += dAqk @ k_ops + dAqb @ b_ops, plus the q-side
             # partials of dk/db
-            T.gemm(dA1_shared, k_ops, dq_intra)
-            T.gemm(dA2_shared, b_ops, dq_intra)
-            T.gemm(dA1_shared, q_ops, dk_intra, transpose_A=True)
-            T.gemm(dA2_shared, q_ops, db_intra, transpose_A=True)
+            if split_dots:
+                for r, c in T.Parallel(BT, BK):
+                    hi = T.Cast(in_dtype, k_ops[r, c])
+                    op_hi[r, c] = hi
+                    op_lo[r, c] = T.Cast(in_dtype, k_ops[r, c] - T.Cast(acc_dtype, hi))
+                T.gemm(dA1_shared, op_hi, dq_intra)
+                T.gemm(dA1_shared, op_lo, dq_intra)
+                for r, c in T.Parallel(BT, BK):
+                    hi = T.Cast(in_dtype, b_ops[r, c])
+                    op_hi[r, c] = hi
+                    op_lo[r, c] = T.Cast(in_dtype, b_ops[r, c] - T.Cast(acc_dtype, hi))
+                T.gemm(dA2_shared, op_hi, dq_intra)
+                T.gemm(dA2_shared, op_lo, dq_intra)
+                for r, c in T.Parallel(BT, BK):
+                    hi = T.Cast(in_dtype, q_ops[r, c])
+                    op_hi[r, c] = hi
+                    op_lo[r, c] = T.Cast(in_dtype, q_ops[r, c] - T.Cast(acc_dtype, hi))
+                T.gemm(dA1_shared, op_hi, dk_intra, transpose_A=True)
+                T.gemm(dA1_shared, op_lo, dk_intra, transpose_A=True)
+                T.gemm(dA2_shared, op_hi, db_intra, transpose_A=True)
+                T.gemm(dA2_shared, op_lo, db_intra, transpose_A=True)
+            else:
+                T.gemm(dA1_shared, k_ops, dq_intra)
+                T.gemm(dA2_shared, b_ops, dq_intra)
+                T.gemm(dA1_shared, q_ops, dk_intra, transpose_A=True)
+                T.gemm(dA2_shared, q_ops, db_intra, transpose_A=True)
 
             # Overwrite the staging tiles with the a-side pair, masked to the
             # strict lower triangle
@@ -307,22 +347,44 @@ def _chunk_dplr_bwd_kernel_intra(
                 for r, c in T.Parallel(BT, BT):
                     t = bos + r
                     if t < eos:
-                        dA1_shared[r, c] = T.Cast(acc_dtype, dAak[t, i_h, c])
-                        dA2_shared[r, c] = T.Cast(acc_dtype, dAab[t, i_h, c])
+                        dA1_shared[r, c] = T.Cast(dA_dtype, dAak[t, i_h, c])
+                        dA2_shared[r, c] = T.Cast(dA_dtype, dAab[t, i_h, c])
                     else:
-                        dA1_shared[r, c] = T.float32(0.0)
-                        dA2_shared[r, c] = T.float32(0.0)
+                        dA1_shared[r, c] = T.Cast(dA_dtype, 0.0)
+                        dA2_shared[r, c] = T.Cast(dA_dtype, 0.0)
             for r, c in T.Parallel(BT, BT):
                 if r <= c:
-                    dA1_shared[r, c] = T.float32(0.0)
-                    dA2_shared[r, c] = T.float32(0.0)
+                    dA1_shared[r, c] = T.Cast(dA_dtype, 0.0)
+                    dA2_shared[r, c] = T.Cast(dA_dtype, 0.0)
 
             # a-side group: da += dAak @ k_ops + dAab @ b_ops, plus the a-side
             # partials of dk/db
-            T.gemm(dA1_shared, k_ops, da_intra)
-            T.gemm(dA2_shared, b_ops, da_intra)
-            T.gemm(dA1_shared, a_ops, dk_intra, transpose_A=True)
-            T.gemm(dA2_shared, a_ops, db_intra, transpose_A=True)
+            if split_dots:
+                for r, c in T.Parallel(BT, BK):
+                    hi = T.Cast(in_dtype, k_ops[r, c])
+                    op_hi[r, c] = hi
+                    op_lo[r, c] = T.Cast(in_dtype, k_ops[r, c] - T.Cast(acc_dtype, hi))
+                T.gemm(dA1_shared, op_hi, da_intra)
+                T.gemm(dA1_shared, op_lo, da_intra)
+                for r, c in T.Parallel(BT, BK):
+                    hi = T.Cast(in_dtype, b_ops[r, c])
+                    op_hi[r, c] = hi
+                    op_lo[r, c] = T.Cast(in_dtype, b_ops[r, c] - T.Cast(acc_dtype, hi))
+                T.gemm(dA2_shared, op_hi, da_intra)
+                T.gemm(dA2_shared, op_lo, da_intra)
+                for r, c in T.Parallel(BT, BK):
+                    hi = T.Cast(in_dtype, a_ops[r, c])
+                    op_hi[r, c] = hi
+                    op_lo[r, c] = T.Cast(in_dtype, a_ops[r, c] - T.Cast(acc_dtype, hi))
+                T.gemm(dA1_shared, op_hi, dk_intra, transpose_A=True)
+                T.gemm(dA1_shared, op_lo, dk_intra, transpose_A=True)
+                T.gemm(dA2_shared, op_hi, db_intra, transpose_A=True)
+                T.gemm(dA2_shared, op_lo, db_intra, transpose_A=True)
+            else:
+                T.gemm(dA1_shared, k_ops, da_intra)
+                T.gemm(dA2_shared, b_ops, da_intra)
+                T.gemm(dA1_shared, a_ops, dk_intra, transpose_A=True)
+                T.gemm(dA2_shared, a_ops, db_intra, transpose_A=True)
 
             # Load inter-chunk gradients and g_last
             if full_tile:
