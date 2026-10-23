@@ -466,15 +466,20 @@ def chunk_dplr_fwd_h(
     config = _chunk_h_fwd_config(K, V, kg.device.index, active_nseq, H)
     # Double-buffered cp.async chunk loop: pays wherever it launches (the
     # unpipelined walk exposes every operand tile's load latency on the
-    # serial chain). Restricted to BC == BT (trivial sub-chunk loop), where
-    # it is bit-identical to the unpipelined schedule, and BT >= 64 for
-    # now; the tuned small-chunk paths keep their validated schedule.
+    # serial chain). Restricted to BC == BT (trivial sub-chunk loop). The two
+    # schedules reorder the fp32 state accumulation, so they agree only to the
+    # ulp: at BT=32 the comparison differs in dq/da/db/dgk by 1-2 bf16 ulp on
+    # ~1e4 of 2.7e8 elements (64k), with the naive-oracle error ratio and the
+    # cross-backend max diff unchanged. BT=32 uses it too: the tuned
+    # small-chunk configs (BV from _chunk_h_fwd_config) leave it under half the
+    # 99KB cap, and cs32 is the production shape on cc10, where the unpipelined
+    # walk measured 4.6 vs 3.3 us per chunk step.
     # sm90 must stage the bg product through smem (see the kernel body);
     # sm100/sm103 lower the direct accumulation and measure ~5% faster fwd.
     stage_bg = cap_major == 9
     pipelined = (
         BC == BT
-        and BT >= 64
+        and BT >= 32
         and tuning.get("h_base")
         and _chunk_h_smem_bytes(BT, K, config["BV"], in_dtype, pipelined=True, stage_bg=stage_bg)
         <= get_device_smem_optin(kg.device.index)
